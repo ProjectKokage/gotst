@@ -1,0 +1,1099 @@
+#include "gotst/godot/speech_runtime.hpp"
+
+#include "gotst/godot/speech_runtime_config.hpp"
+
+#include <godot_cpp/core/class_db.hpp>
+#include <godot_cpp/variant/packed_string_array.hpp>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <vector>
+
+namespace godot {
+
+namespace {
+
+constexpr double MIN_LOG_ENERGY = 1e-10;
+constexpr double PI = 3.14159265358979323846;
+
+struct DecoderLayout {
+    bool has_layout = false;
+    int64_t time_steps = 0;
+    int64_t time_stride = 0;
+    int64_t channel_stride = 0;
+    int64_t channel_count = 1;
+};
+
+template <typename T>
+T clamp_value(T value, T low, T high) {
+    return std::min(std::max(value, low), high);
+}
+
+PackedFloat32Array empty_float_array() {
+    return PackedFloat32Array();
+}
+
+PackedInt64Array empty_int64_array() {
+    return PackedInt64Array();
+}
+
+double hz_to_slaney_mel(double value) {
+    double mel = (3.0 * value) / 200.0;
+    if(value >= 1000.0) {
+        mel = 15.0 + (std::log(value / 1000.0) * (27.0 / std::log(6.4)));
+    }
+    return mel;
+}
+
+double slaney_mel_to_hz(double value) {
+    double hz = (200.0 * value) / 3.0;
+    if(value >= 15.0) {
+        hz = 1000.0 * std::exp((std::log(6.4) / 27.0) * (value - 15.0));
+    }
+    return hz;
+}
+
+int64_t reflect_index(int64_t index, int64_t count) {
+    if(count <= 1) {
+        return 0;
+    }
+    int64_t reflected = index;
+    while(reflected < 0 || reflected >= count) {
+        if(reflected < 0) {
+            reflected = -reflected;
+        }
+        if(reflected >= count) {
+            reflected = (count * 2) - reflected - 2;
+        }
+    }
+    return reflected;
+}
+
+PackedFloat32Array resample_linear(
+    const PackedFloat32Array &source,
+    int64_t from_rate,
+    int64_t to_rate
+) {
+    if(source.is_empty() || from_rate <= 0 || to_rate <= 0 || from_rate == to_rate) {
+        return source;
+    }
+
+    const int64_t target_size = std::max<int64_t>(
+        1,
+        static_cast<int64_t>(std::llround(
+            static_cast<double>(source.size()) * static_cast<double>(to_rate) / static_cast<double>(from_rate)
+        ))
+    );
+    PackedFloat32Array result;
+    result.resize(target_size);
+    const double ratio = static_cast<double>(from_rate) / static_cast<double>(to_rate);
+    for(int64_t index = 0; index < target_size; ++index) {
+        const double position = static_cast<double>(index) * ratio;
+        const int64_t left = static_cast<int64_t>(std::floor(position));
+        const int64_t right = std::min<int64_t>(left + 1, source.size() - 1);
+        const double fraction = position - static_cast<double>(left);
+        const double left_value = source[left];
+        const double right_value = source[right];
+        result.set(index, static_cast<float>(left_value + ((right_value - left_value) * fraction)));
+    }
+    return result;
+}
+
+void compute_power_spectrum(
+    const PackedFloat32Array &samples,
+    int64_t offset,
+    int64_t freq_bins,
+    const PackedFloat32Array &window,
+    const PackedFloat32Array &cos_table,
+    const PackedFloat32Array &sin_table,
+    int64_t fft_size,
+    PackedFloat32Array &destination
+) {
+    for(int64_t freq = 0; freq < freq_bins; ++freq) {
+        double real = 0.0;
+        double imag = 0.0;
+        const int64_t table_offset = freq * fft_size;
+        for(int64_t sample_index = 0; sample_index < fft_size; ++sample_index) {
+            const int64_t source_index = offset + sample_index;
+            double sample = 0.0;
+            if(source_index < 0 || source_index >= samples.size()) {
+                const int64_t reflected = reflect_index(source_index, samples.size());
+                if(reflected >= 0 && reflected < samples.size()) {
+                    sample = samples[reflected];
+                }
+            } else {
+                sample = samples[source_index];
+            }
+            const double windowed = sample * window[sample_index];
+            real += windowed * cos_table[table_offset + sample_index];
+            imag -= windowed * sin_table[table_offset + sample_index];
+        }
+        destination.set(freq, static_cast<float>((real * real) + (imag * imag)));
+    }
+}
+
+PackedFloat32Array build_window(int64_t fft_size) {
+    PackedFloat32Array window;
+    window.resize(fft_size);
+    if(fft_size <= 1) {
+        if(fft_size == 1) {
+            window.set(0, 1.0f);
+        }
+        return window;
+    }
+    for(int64_t index = 0; index < fft_size; ++index) {
+        window.set(
+            index,
+            static_cast<float>(0.5 - (0.5 * std::cos((2.0 * PI * static_cast<double>(index)) / static_cast<double>(fft_size))))
+        );
+    }
+    return window;
+}
+
+void build_fft_tables(
+    int64_t fft_size,
+    int64_t freq_bins,
+    PackedFloat32Array &cos_table,
+    PackedFloat32Array &sin_table
+) {
+    cos_table.resize(fft_size * freq_bins);
+    sin_table.resize(fft_size * freq_bins);
+    const double denom = static_cast<double>(std::max<int64_t>(fft_size, 1));
+    for(int64_t freq = 0; freq < freq_bins; ++freq) {
+        for(int64_t index = 0; index < fft_size; ++index) {
+            const double angle = (2.0 * PI * static_cast<double>(freq * index)) / denom;
+            const int64_t table_index = (freq * fft_size) + index;
+            cos_table.set(table_index, static_cast<float>(std::cos(angle)));
+            sin_table.set(table_index, static_cast<float>(std::sin(angle)));
+        }
+    }
+}
+
+std::vector<PackedFloat32Array> build_mel_filter_bank(
+    int64_t sample_rate,
+    int64_t mel_bins,
+    int64_t fft_size,
+    int64_t freq_bins
+) {
+    std::vector<PackedFloat32Array> bank;
+    bank.reserve(mel_bins);
+
+    const double mel_min = hz_to_slaney_mel(0.0);
+    const double mel_max = hz_to_slaney_mel(static_cast<double>(sample_rate) * 0.5);
+
+    std::vector<double> filter_freqs;
+    filter_freqs.reserve(mel_bins + 2);
+    const double denom = static_cast<double>(std::max<int64_t>(mel_bins + 1, 1));
+    for(int64_t index = 0; index < mel_bins + 2; ++index) {
+        const double t = static_cast<double>(index) / denom;
+        const double mel_value = mel_min + ((mel_max - mel_min) * t);
+        filter_freqs.push_back(slaney_mel_to_hz(mel_value));
+    }
+
+    std::vector<double> fft_freqs;
+    fft_freqs.reserve(freq_bins);
+    const double max_frequency = static_cast<double>(sample_rate) * 0.5;
+    const double max_freq_index = static_cast<double>(std::max<int64_t>(freq_bins - 1, 1));
+    for(int64_t freq_index = 0; freq_index < freq_bins; ++freq_index) {
+        fft_freqs.push_back((max_frequency * static_cast<double>(freq_index)) / max_freq_index);
+    }
+
+    for(int64_t mel_index = 0; mel_index < mel_bins; ++mel_index) {
+        PackedFloat32Array row;
+        row.resize(freq_bins);
+        const double left_hz = filter_freqs[mel_index];
+        const double center_hz = filter_freqs[mel_index + 1];
+        const double right_hz = filter_freqs[mel_index + 2];
+        const double down_width = std::max(center_hz - left_hz, 1e-12);
+        const double up_width = std::max(right_hz - center_hz, 1e-12);
+        const double slaney_norm = 2.0 / std::max(right_hz - left_hz, 1e-12);
+
+        for(int64_t freq_index = 0; freq_index < freq_bins; ++freq_index) {
+            const double fft_hz = fft_freqs[freq_index];
+            const double down_slope = (fft_hz - left_hz) / down_width;
+            const double up_slope = (right_hz - fft_hz) / up_width;
+            row.set(freq_index, static_cast<float>(std::max(0.0, std::min(down_slope, up_slope)) * slaney_norm));
+        }
+        bank.push_back(row);
+    }
+
+    return bank;
+}
+
+DecoderLayout resolve_decoder_output_layout(const PackedInt64Array &shape, int64_t output_length) {
+    if(shape.size() < 2 || output_length <= 0) {
+        return {
+            .has_layout = false,
+            .time_steps = output_length,
+            .time_stride = 0,
+            .channel_stride = 0,
+            .channel_count = 1,
+        };
+    }
+
+    std::vector<int64_t> dims;
+    dims.reserve(shape.size());
+    for(int64_t index = 0; index < shape.size(); ++index) {
+        dims.push_back(shape[index]);
+    }
+
+    std::vector<int64_t> strides(dims.size(), 1);
+    int64_t running_stride = 1;
+    for(int64_t index = static_cast<int64_t>(dims.size()) - 1; index >= 0; --index) {
+        strides[index] = running_stride;
+        running_stride *= std::max<int64_t>(dims[index], 1);
+    }
+
+    const int64_t time_axis = std::max<int64_t>(0, static_cast<int64_t>(dims.size()) - 1);
+    const int64_t time_steps = std::max<int64_t>(1, dims[time_axis]);
+    int64_t channel_axis = -1;
+    int64_t channel_count = 1;
+    for(int64_t axis = 0; axis < time_axis; ++axis) {
+        if(dims[axis] > 1) {
+            channel_axis = axis;
+            channel_count = dims[axis];
+            break;
+        }
+    }
+
+    return {
+        .has_layout = true,
+        .time_steps = time_steps,
+        .time_stride = strides[time_axis],
+        .channel_stride = channel_axis >= 0 ? strides[channel_axis] : 0,
+        .channel_count = channel_count,
+    };
+}
+
+int64_t next_rng_state(int64_t state) {
+    int64_t resolved_state = state;
+    if(resolved_state == 0) {
+        resolved_state = 1;
+    }
+    resolved_state ^= (resolved_state << 13);
+    resolved_state ^= (resolved_state >> 17);
+    resolved_state ^= (resolved_state << 5);
+    if(resolved_state == 0) {
+        return 1;
+    }
+    return resolved_state;
+}
+
+double uniform_from_state(int64_t state) {
+    const int64_t mantissa = state & 0x00FFFFFF;
+    return static_cast<double>(mantissa) / 16777216.0;
+}
+
+} // namespace
+
+void GotstSpeechRuntime::_bind_methods() {
+    ClassDB::bind_method(D_METHOD("set_config", "config"), &GotstSpeechRuntime::set_config);
+    ClassDB::bind_method(D_METHOD("get_config"), &GotstSpeechRuntime::get_config);
+    ClassDB::bind_method(D_METHOD("clear_config"), &GotstSpeechRuntime::clear_config);
+    ClassDB::bind_method(D_METHOD("inspect_backends"), &GotstSpeechRuntime::inspect_backends);
+    ClassDB::bind_method(D_METHOD("packed_int64_range", "length"), &GotstSpeechRuntime::packed_int64_range);
+    ClassDB::bind_method(D_METHOD("packed_int32_range", "length"), &GotstSpeechRuntime::packed_int32_range);
+    ClassDB::bind_method(D_METHOD("packed_int64_ones", "length"), &GotstSpeechRuntime::packed_int64_ones);
+    ClassDB::bind_method(
+        D_METHOD("build_triplicate_position_ids", "sequence_length"),
+        &GotstSpeechRuntime::build_triplicate_position_ids
+    );
+    ClassDB::bind_method(
+        D_METHOD("slice_rows", "source", "start_row", "row_count", "hidden_size"),
+        &GotstSpeechRuntime::slice_rows
+    );
+    ClassDB::bind_method(D_METHOD("concat_rows", "parts"), &GotstSpeechRuntime::concat_rows);
+    ClassDB::bind_method(D_METHOD("repeat_row", "row", "repeat_count"), &GotstSpeechRuntime::repeat_row);
+    ClassDB::bind_method(D_METHOD("add_vectors", "a", "b"), &GotstSpeechRuntime::add_vectors);
+    ClassDB::bind_method(D_METHOD("sum_vectors", "parts"), &GotstSpeechRuntime::sum_vectors);
+    ClassDB::bind_method(D_METHOD("extract_sequence", "values", "shape"), &GotstSpeechRuntime::extract_sequence);
+    ClassDB::bind_method(
+        D_METHOD("extract_last_hidden_row", "hidden_states", "hidden_shape", "hidden_size"),
+        &GotstSpeechRuntime::extract_last_hidden_row
+    );
+    ClassDB::bind_method(
+        D_METHOD("contains_only_finite_values", "values"),
+        &GotstSpeechRuntime::contains_only_finite_values
+    );
+    ClassDB::bind_method(
+        D_METHOD("select_last_row_argmax", "logits", "logits_shape", "start_index", "count"),
+        &GotstSpeechRuntime::select_last_row_argmax
+    );
+    ClassDB::bind_method(
+        D_METHOD(
+            "select_last_row_token",
+            "logits",
+            "logits_shape",
+            "start_index",
+            "count",
+            "do_sample",
+            "top_k",
+            "top_p",
+            "temperature",
+            "prior_tokens",
+            "repetition_penalty",
+            "rng_state"
+        ),
+        &GotstSpeechRuntime::select_last_row_token
+    );
+    ClassDB::bind_method(
+        D_METHOD("should_stop_on_eos", "logits", "logits_shape", "eos_token_id", "codec_size", "eos_logit_margin"),
+        &GotstSpeechRuntime::should_stop_on_eos
+    );
+    ClassDB::bind_method(
+        D_METHOD("convert_decoder_output_to_waveform", "output", "output_shape", "sample_rate", "normalize_waveform", "waveform_gain"),
+        &GotstSpeechRuntime::convert_decoder_output_to_waveform
+    );
+    ClassDB::bind_method(
+        D_METHOD(
+            "build_log_mel_features",
+            "waveform",
+            "input_sample_rate",
+            "sample_rate",
+            "mel_bins",
+            "fft_size",
+            "hop_length",
+            "chunk_length_seconds"
+        ),
+        &GotstSpeechRuntime::build_log_mel_features
+    );
+    ClassDB::bind_method(
+        D_METHOD(
+            "build_tts_initial_language_input",
+            "text_projected_states",
+            "text_sequence_length",
+            "special_projected_states",
+            "codec_pad_embedding",
+            "codec_prefill_embeddings",
+            "codec_prefill_length",
+            "speaker_prompt_embedding",
+            "instruction_projected_states",
+            "instruction_sequence_length",
+            "hidden_size",
+            "wrapped_prefix_token_count",
+            "wrapped_suffix_token_count"
+        ),
+        &GotstSpeechRuntime::build_tts_initial_language_input
+    );
+
+    ADD_PROPERTY(
+        PropertyInfo(Variant::OBJECT, "config", PROPERTY_HINT_RESOURCE_TYPE, "GotstSpeechRuntimeConfig"),
+        "set_config",
+        "get_config"
+    );
+}
+
+void GotstSpeechRuntime::set_config(const Ref<GotstSpeechRuntimeConfig> &config) {
+    config_ = config;
+}
+
+Ref<GotstSpeechRuntimeConfig> GotstSpeechRuntime::get_config() const {
+    return config_;
+}
+
+void GotstSpeechRuntime::clear_config() {
+    config_.unref();
+}
+
+Dictionary GotstSpeechRuntime::inspect_backends() const {
+    gotst::RuntimeConfig native_config;
+    if(config_.is_valid()) {
+        native_config = config_->build_native_config();
+    }
+
+    const gotst::BackendSummary summary = core_.inspect(native_config);
+
+    PackedStringArray missing_paths;
+    for(const std::string &item : summary.missing_paths) {
+        missing_paths.append(String::utf8(item.c_str()));
+    }
+
+    PackedStringArray notes;
+    for(const std::string &item : summary.notes) {
+        notes.append(String::utf8(item.c_str()));
+    }
+
+    Dictionary payload;
+    payload["uses_llama_core"] = summary.uses_llama_core;
+    payload["uses_onnx_core"] = summary.uses_onnx_core;
+    payload["asr_hybrid_requested"] = summary.asr_hybrid_requested;
+    payload["tts_hybrid_requested"] = summary.tts_hybrid_requested;
+    payload["asr_hybrid_ready"] = summary.asr_hybrid_ready;
+    payload["tts_hybrid_ready"] = summary.tts_hybrid_ready;
+    payload["onnx_session_loaded"] = summary.onnx_session_loaded;
+    payload["llama_worker_running"] = summary.llama_worker_running;
+    payload["missing_paths"] = missing_paths;
+    payload["notes"] = notes;
+    return payload;
+}
+
+PackedInt64Array GotstSpeechRuntime::packed_int64_range(int64_t length) const {
+    PackedInt64Array packed;
+    const int64_t resolved_length = std::max<int64_t>(length, 0);
+    packed.resize(resolved_length);
+    for(int64_t index = 0; index < resolved_length; ++index) {
+        packed.set(index, index);
+    }
+    return packed;
+}
+
+PackedInt32Array GotstSpeechRuntime::packed_int32_range(int64_t length) const {
+    PackedInt32Array packed;
+    const int64_t resolved_length = std::max<int64_t>(length, 0);
+    packed.resize(resolved_length);
+    for(int64_t index = 0; index < resolved_length; ++index) {
+        packed.set(index, static_cast<int32_t>(index));
+    }
+    return packed;
+}
+
+PackedInt64Array GotstSpeechRuntime::packed_int64_ones(int64_t length) const {
+    PackedInt64Array packed;
+    const int64_t resolved_length = std::max<int64_t>(length, 0);
+    packed.resize(resolved_length);
+    for(int64_t index = 0; index < resolved_length; ++index) {
+        packed.set(index, 1);
+    }
+    return packed;
+}
+
+PackedInt64Array GotstSpeechRuntime::build_triplicate_position_ids(int64_t sequence_length) const {
+    const int64_t resolved_length = std::max<int64_t>(sequence_length, 1);
+    PackedInt64Array packed;
+    packed.resize(resolved_length * 3);
+    for(int64_t index = 0; index < resolved_length; ++index) {
+        packed.set(index, index);
+        packed.set(resolved_length + index, index);
+        packed.set((resolved_length * 2) + index, index);
+    }
+    return packed;
+}
+
+PackedFloat32Array GotstSpeechRuntime::slice_rows(
+    const PackedFloat32Array &source,
+    int64_t start_row,
+    int64_t row_count,
+    int64_t hidden_size
+) const {
+    if(source.is_empty() || row_count <= 0 || hidden_size <= 0) {
+        return empty_float_array();
+    }
+
+    const int64_t safe_start_row = std::max<int64_t>(start_row, 0);
+    const int64_t available_rows = source.size() / hidden_size;
+    if(safe_start_row >= available_rows) {
+        return empty_float_array();
+    }
+
+    const int64_t safe_row_count = std::min<int64_t>(row_count, available_rows - safe_start_row);
+    if(safe_row_count <= 0) {
+        return empty_float_array();
+    }
+
+    PackedFloat32Array slice;
+    slice.resize(safe_row_count * hidden_size);
+    const int64_t read_offset = safe_start_row * hidden_size;
+    for(int64_t index = 0; index < slice.size(); ++index) {
+        slice.set(index, source[read_offset + index]);
+    }
+    return slice;
+}
+
+PackedFloat32Array GotstSpeechRuntime::concat_rows(const Array &parts) const {
+    int64_t total_size = 0;
+    for(int64_t index = 0; index < parts.size(); ++index) {
+        const PackedFloat32Array part = parts[index];
+        total_size += part.size();
+    }
+
+    PackedFloat32Array combined;
+    combined.resize(total_size);
+    int64_t cursor = 0;
+    for(int64_t part_index = 0; part_index < parts.size(); ++part_index) {
+        const PackedFloat32Array part = parts[part_index];
+        for(int64_t value_index = 0; value_index < part.size(); ++value_index) {
+            combined.set(cursor++, part[value_index]);
+        }
+    }
+    return combined;
+}
+
+PackedFloat32Array GotstSpeechRuntime::repeat_row(const PackedFloat32Array &row, int64_t repeat_count) const {
+    if(row.is_empty() || repeat_count <= 0) {
+        return empty_float_array();
+    }
+
+    PackedFloat32Array repeated;
+    repeated.resize(row.size() * repeat_count);
+    int64_t cursor = 0;
+    for(int64_t repeat_index = 0; repeat_index < repeat_count; ++repeat_index) {
+        for(int64_t row_index = 0; row_index < row.size(); ++row_index) {
+            repeated.set(cursor++, row[row_index]);
+        }
+    }
+    return repeated;
+}
+
+PackedFloat32Array GotstSpeechRuntime::add_vectors(const PackedFloat32Array &a, const PackedFloat32Array &b) const {
+    if(a.is_empty() || a.size() != b.size()) {
+        return empty_float_array();
+    }
+
+    PackedFloat32Array result;
+    result.resize(a.size());
+    for(int64_t index = 0; index < a.size(); ++index) {
+        result.set(index, a[index] + b[index]);
+    }
+    return result;
+}
+
+PackedFloat32Array GotstSpeechRuntime::sum_vectors(const Array &parts) const {
+    PackedFloat32Array seed;
+    for(int64_t index = 0; index < parts.size(); ++index) {
+        const PackedFloat32Array part = parts[index];
+        if(!part.is_empty()) {
+            seed = part;
+            break;
+        }
+    }
+    if(seed.is_empty()) {
+        return empty_float_array();
+    }
+
+    PackedFloat32Array result;
+    result.resize(seed.size());
+    for(int64_t index = 0; index < seed.size(); ++index) {
+        result.set(index, 0.0f);
+    }
+
+    for(int64_t part_index = 0; part_index < parts.size(); ++part_index) {
+        const PackedFloat32Array part = parts[part_index];
+        if(part.is_empty()) {
+            continue;
+        }
+        if(part.size() != result.size()) {
+            return empty_float_array();
+        }
+        for(int64_t value_index = 0; value_index < result.size(); ++value_index) {
+            result.set(value_index, result[value_index] + part[value_index]);
+        }
+    }
+    return result;
+}
+
+Dictionary GotstSpeechRuntime::extract_sequence(const PackedFloat32Array &values, const PackedInt64Array &shape) const {
+    if(values.is_empty()) {
+        return {};
+    }
+
+    const int64_t shape_size = shape.size();
+    const int64_t hidden_size = shape_size >= 1 ? shape[shape_size - 1] : values.size();
+    const int64_t sequence_length = shape_size >= 2 ? shape[shape_size - 2] : 1;
+    const int64_t required_length = hidden_size * sequence_length;
+    if(required_length <= 0 || required_length > values.size()) {
+        return {};
+    }
+
+    PackedFloat32Array sequence_values;
+    sequence_values.resize(required_length);
+    for(int64_t index = 0; index < required_length; ++index) {
+        sequence_values.set(index, values[index]);
+    }
+    Dictionary payload;
+    payload["values"] = sequence_values;
+    payload["sequence_length"] = sequence_length;
+    payload["hidden_size"] = hidden_size;
+    return payload;
+}
+
+PackedFloat32Array GotstSpeechRuntime::extract_last_hidden_row(
+    const PackedFloat32Array &hidden_states,
+    const PackedInt64Array &hidden_shape,
+    int64_t hidden_size
+) const {
+    if(hidden_states.is_empty() || hidden_size <= 0) {
+        return empty_float_array();
+    }
+    int64_t resolved_hidden_size = hidden_size;
+    if(hidden_shape.size() >= 1) {
+        resolved_hidden_size = hidden_shape[hidden_shape.size() - 1];
+    }
+    if(resolved_hidden_size != hidden_size) {
+        return empty_float_array();
+    }
+    const int64_t row_count = std::max<int64_t>(1, hidden_states.size() / hidden_size);
+    return slice_rows(hidden_states, row_count - 1, 1, hidden_size);
+}
+
+bool GotstSpeechRuntime::contains_only_finite_values(const PackedFloat32Array &values) const {
+    for(int64_t index = 0; index < values.size(); ++index) {
+        if(!std::isfinite(static_cast<double>(values[index]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int64_t GotstSpeechRuntime::select_last_row_argmax(
+    const PackedFloat32Array &logits,
+    const PackedInt64Array &logits_shape,
+    int64_t start_index,
+    int64_t count
+) const {
+    if(logits.is_empty() || logits_shape.is_empty()) {
+        return -1;
+    }
+
+    const int64_t vocab_size = logits_shape[logits_shape.size() - 1];
+    if(vocab_size <= 0) {
+        return -1;
+    }
+
+    const int64_t rows = std::max<int64_t>(1, logits.size() / vocab_size);
+    const int64_t row_start = (rows - 1) * vocab_size;
+    const int64_t safe_start = clamp_value<int64_t>(start_index, 0, std::max<int64_t>(0, vocab_size - 1));
+    const int64_t safe_count = clamp_value<int64_t>(count, 1, std::max<int64_t>(1, vocab_size - safe_start));
+    int64_t best_index = safe_start;
+    float best_value = -std::numeric_limits<float>::infinity();
+    for(int64_t offset = 0; offset < safe_count; ++offset) {
+        const int64_t token_index = safe_start + offset;
+        const float value = logits[row_start + token_index];
+        if(value > best_value) {
+            best_value = value;
+            best_index = token_index;
+        }
+    }
+    return best_index;
+}
+
+Dictionary GotstSpeechRuntime::select_last_row_token(
+    const PackedFloat32Array &logits,
+    const PackedInt64Array &logits_shape,
+    int64_t start_index,
+    int64_t count,
+    bool do_sample,
+    int64_t top_k,
+    double top_p,
+    double temperature,
+    const Dictionary &prior_tokens,
+    double repetition_penalty,
+    int64_t rng_state
+) const {
+    if(!do_sample) {
+        Dictionary payload;
+        payload["token"] = select_last_row_argmax(logits, logits_shape, start_index, count);
+        payload["rng_state"] = rng_state;
+        return payload;
+    }
+
+    if(logits.is_empty() || logits_shape.is_empty()) {
+        Dictionary payload;
+        payload["token"] = -1;
+        payload["rng_state"] = rng_state;
+        return payload;
+    }
+
+    const int64_t vocab_size = logits_shape[logits_shape.size() - 1];
+    if(vocab_size <= 0) {
+        Dictionary payload;
+        payload["token"] = -1;
+        payload["rng_state"] = rng_state;
+        return payload;
+    }
+
+    const int64_t rows = std::max<int64_t>(1, logits.size() / std::max<int64_t>(vocab_size, 1));
+    const int64_t row_start = (rows - 1) * vocab_size;
+    const int64_t safe_start = clamp_value<int64_t>(start_index, 0, std::max<int64_t>(0, vocab_size - 1));
+    const int64_t safe_count = clamp_value<int64_t>(count, 1, std::max<int64_t>(1, vocab_size - safe_start));
+    const int64_t candidate_count = clamp_value<int64_t>(top_k, 1, safe_count);
+    const double temp = std::max(0.05, temperature);
+
+    struct Candidate {
+        int64_t token = -1;
+        double value = 0.0;
+    };
+
+    std::vector<Candidate> candidates;
+    candidates.reserve(safe_count);
+    for(int64_t offset = 0; offset < safe_count; ++offset) {
+        const int64_t token_index = safe_start + offset;
+        double value = logits[row_start + token_index];
+        if(prior_tokens.has(token_index) && repetition_penalty > 1.0) {
+            value = value >= 0.0 ? (value / repetition_penalty) : (value * repetition_penalty);
+        }
+        candidates.push_back({token_index, value / temp});
+    }
+
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate &a, const Candidate &b) {
+        return a.value > b.value;
+    });
+    if(static_cast<int64_t>(candidates.size()) > candidate_count) {
+        candidates.resize(candidate_count);
+    }
+    if(candidates.empty()) {
+        Dictionary payload;
+        payload["token"] = select_last_row_argmax(logits, logits_shape, start_index, count);
+        payload["rng_state"] = rng_state;
+        return payload;
+    }
+
+    if(top_p < 0.999) {
+        const double max_logit = candidates.front().value;
+        double sum_exp = 0.0;
+        std::vector<double> exp_values;
+        exp_values.reserve(candidates.size());
+        for(const Candidate &candidate : candidates) {
+            const double exp_value = std::exp(candidate.value - max_logit);
+            exp_values.push_back(exp_value);
+            sum_exp += exp_value;
+        }
+
+        double cumulative = 0.0;
+        int64_t final_count = 0;
+        for(int64_t index = 0; index < static_cast<int64_t>(exp_values.size()); ++index) {
+            cumulative += exp_values[index] / std::max(sum_exp, 1e-12);
+            final_count = index + 1;
+            if(cumulative >= top_p) {
+                break;
+            }
+        }
+        final_count = clamp_value<int64_t>(final_count, 1, static_cast<int64_t>(candidates.size()));
+        candidates.resize(final_count);
+    }
+
+    const double max_value = candidates.front().value;
+    double sum_final = 0.0;
+    for(const Candidate &candidate : candidates) {
+        sum_final += std::exp(candidate.value - max_value);
+    }
+
+    const int64_t next_state = next_rng_state(rng_state);
+    const double sample = uniform_from_state(next_state) * sum_final;
+    double cumulative_final = 0.0;
+    for(const Candidate &candidate : candidates) {
+        cumulative_final += std::exp(candidate.value - max_value);
+        if(sample <= cumulative_final) {
+            Dictionary payload;
+            payload["token"] = candidate.token;
+            payload["rng_state"] = next_state;
+            return payload;
+        }
+    }
+
+    Dictionary payload;
+    payload["token"] = candidates.front().token;
+    payload["rng_state"] = next_state;
+    return payload;
+}
+
+bool GotstSpeechRuntime::should_stop_on_eos(
+    const PackedFloat32Array &logits,
+    const PackedInt64Array &logits_shape,
+    int64_t eos_token_id,
+    int64_t codec_size,
+    double eos_logit_margin
+) const {
+    if(logits.is_empty() || logits_shape.is_empty()) {
+        return false;
+    }
+    const int64_t vocab_size = logits_shape[logits_shape.size() - 1];
+    if(eos_token_id < 0 || eos_token_id >= vocab_size) {
+        return false;
+    }
+    const int64_t rows = std::max<int64_t>(1, logits.size() / std::max<int64_t>(vocab_size, 1));
+    const int64_t row_start = (rows - 1) * vocab_size;
+    const float eos_logit = logits[row_start + eos_token_id];
+    float best_codec_logit = -std::numeric_limits<float>::infinity();
+    const int64_t safe_codec_size = clamp_value<int64_t>(codec_size, 1, vocab_size);
+    for(int64_t index = 0; index < safe_codec_size; ++index) {
+        best_codec_logit = std::max(best_codec_logit, logits[row_start + index]);
+    }
+    return static_cast<double>(eos_logit) > (static_cast<double>(best_codec_logit) + eos_logit_margin);
+}
+
+PackedFloat32Array GotstSpeechRuntime::convert_decoder_output_to_waveform(
+    const PackedFloat32Array &output,
+    const PackedInt64Array &output_shape,
+    int64_t sample_rate,
+    bool normalize_waveform,
+    double waveform_gain
+) const {
+    if(output.is_empty()) {
+        return empty_float_array();
+    }
+
+    const DecoderLayout layout = resolve_decoder_output_layout(output_shape, output.size());
+    const int64_t sample_count = layout.time_steps;
+    if(sample_count <= 0) {
+        return empty_float_array();
+    }
+
+    PackedFloat32Array waveform;
+    waveform.resize(sample_count);
+    double sum = 0.0;
+    double peak = 0.0;
+
+    if(!layout.has_layout) {
+        for(int64_t index = 0; index < sample_count; ++index) {
+            const double sample = clamp_value<double>(output[index], -1.5, 1.5) * waveform_gain;
+            waveform.set(index, static_cast<float>(sample));
+            sum += sample;
+            peak = std::max(peak, std::abs(sample));
+        }
+    } else {
+        const bool downmix = layout.channel_count > 1 && layout.channel_stride > 0;
+        for(int64_t time_index = 0; time_index < sample_count; ++time_index) {
+            double raw = 0.0;
+            const int64_t base_index = time_index * layout.time_stride;
+            if(!downmix) {
+                if(base_index >= 0 && base_index < output.size()) {
+                    raw = output[base_index];
+                }
+            } else {
+                for(int64_t channel_index = 0; channel_index < layout.channel_count; ++channel_index) {
+                    const int64_t sample_index = base_index + (channel_index * layout.channel_stride);
+                    if(sample_index >= 0 && sample_index < output.size()) {
+                        raw += output[sample_index];
+                    }
+                }
+                raw /= static_cast<double>(std::max<int64_t>(layout.channel_count, 1));
+            }
+            const double sample = clamp_value<double>(raw, -1.5, 1.5) * waveform_gain;
+            waveform.set(time_index, static_cast<float>(sample));
+            sum += sample;
+            peak = std::max(peak, std::abs(sample));
+        }
+    }
+
+    const double dc_offset = sum / static_cast<double>(std::max<int64_t>(sample_count, 1));
+    for(int64_t index = 0; index < waveform.size(); ++index) {
+        waveform.set(index, waveform[index] - dc_offset);
+    }
+
+    peak = 0.0;
+    for(int64_t index = 0; index < waveform.size(); ++index) {
+        peak = std::max(peak, std::abs(static_cast<double>(waveform[index])));
+    }
+
+    if(normalize_waveform && peak > 0.00001) {
+        const double normalize_scale = std::min(1.0, 0.95 / peak);
+        for(int64_t index = 0; index < waveform.size(); ++index) {
+            waveform.set(index, static_cast<float>(waveform[index] * normalize_scale));
+        }
+    }
+
+    for(int64_t index = 0; index < waveform.size(); ++index) {
+        waveform.set(index, clamp_value<float>(waveform[index], -1.0f, 1.0f));
+    }
+
+    const int64_t edge_fade = clamp_value<int64_t>(
+        static_cast<int64_t>(std::llround(0.004 * static_cast<double>(sample_rate))),
+        8,
+        std::max<int64_t>(8, sample_count / 10)
+    );
+    const int64_t safe_edge_fade = std::min<int64_t>(edge_fade, waveform.size() / 2);
+    for(int64_t index = 0; index < safe_edge_fade; ++index) {
+        const double scale = static_cast<double>(index) / static_cast<double>(std::max<int64_t>(safe_edge_fade, 1));
+        waveform.set(index, static_cast<float>(waveform[index] * scale));
+        const int64_t right_index = waveform.size() - 1 - index;
+        waveform.set(right_index, static_cast<float>(waveform[right_index] * scale));
+    }
+
+    return waveform;
+}
+
+Dictionary GotstSpeechRuntime::build_log_mel_features(
+    const PackedFloat32Array &waveform,
+    int64_t input_sample_rate,
+    int64_t sample_rate,
+    int64_t mel_bins,
+    int64_t fft_size,
+    int64_t hop_length,
+    double chunk_length_seconds
+) const {
+    if(waveform.is_empty()) {
+        return {};
+    }
+
+    PackedFloat32Array working = waveform;
+    int64_t working_sample_rate = std::max<int64_t>(input_sample_rate, 1);
+    if(working_sample_rate != sample_rate) {
+        working = resample_linear(working, working_sample_rate, sample_rate);
+        working_sample_rate = sample_rate;
+    }
+
+    const int64_t max_chunk_samples = std::max<int64_t>(
+        1600,
+        static_cast<int64_t>(std::ceil(std::max(chunk_length_seconds, 1.0) * static_cast<double>(sample_rate)))
+    );
+    if(working.size() > max_chunk_samples) {
+        PackedFloat32Array trimmed;
+        trimmed.resize(max_chunk_samples);
+        const int64_t start = working.size() - max_chunk_samples;
+        for(int64_t index = 0; index < max_chunk_samples; ++index) {
+            trimmed.set(index, working[start + index]);
+        }
+        working = trimmed;
+    }
+
+    const int64_t source_samples = working.size();
+    const int64_t freq_bins = (fft_size / 2) + 1;
+    const PackedFloat32Array window = build_window(fft_size);
+    PackedFloat32Array cos_table;
+    PackedFloat32Array sin_table;
+    build_fft_tables(fft_size, freq_bins, cos_table, sin_table);
+    const std::vector<PackedFloat32Array> mel_filter_bank =
+        build_mel_filter_bank(sample_rate, mel_bins, fft_size, freq_bins);
+
+    const int64_t centered_frame_count = std::max<int64_t>(
+        1,
+        1 + static_cast<int64_t>(std::floor(static_cast<double>(source_samples) / static_cast<double>(hop_length)))
+    );
+    const int64_t frame_count = std::max<int64_t>(1, centered_frame_count - 1);
+    PackedFloat32Array features;
+    features.resize(mel_bins * frame_count);
+    PackedFloat32Array spectrum;
+    spectrum.resize(freq_bins);
+    double max_log = -std::numeric_limits<double>::infinity();
+
+    for(int64_t frame_index = 0; frame_index < frame_count; ++frame_index) {
+        const int64_t offset = (frame_index * hop_length) - (fft_size / 2);
+        compute_power_spectrum(working, offset, freq_bins, window, cos_table, sin_table, fft_size, spectrum);
+
+        for(int64_t mel_index = 0; mel_index < mel_bins; ++mel_index) {
+            double energy = 0.0;
+            const PackedFloat32Array &weights = mel_filter_bank[mel_index];
+            for(int64_t freq_index = 0; freq_index < freq_bins; ++freq_index) {
+                energy += static_cast<double>(spectrum[freq_index]) * static_cast<double>(weights[freq_index]);
+            }
+            const double log_energy = std::log10(std::max(MIN_LOG_ENERGY, energy));
+            const int64_t feature_index = (mel_index * frame_count) + frame_index;
+            features.set(feature_index, static_cast<float>(log_energy));
+            max_log = std::max(max_log, log_energy);
+        }
+    }
+
+    if(!std::isfinite(max_log) && max_log < 0.0) {
+        return {};
+    }
+
+    const double floor_value = max_log - 8.0;
+    for(int64_t index = 0; index < features.size(); ++index) {
+        const double normalized = std::max(static_cast<double>(features[index]), floor_value);
+        features.set(index, static_cast<float>((normalized + 4.0) * 0.25));
+    }
+
+    Dictionary payload;
+    payload["features"] = features;
+    payload["frame_count"] = frame_count;
+    payload["valid_frame_count"] = frame_count;
+    return payload;
+}
+
+Dictionary GotstSpeechRuntime::build_tts_initial_language_input(
+    const PackedFloat32Array &text_projected_states,
+    int64_t text_sequence_length,
+    const PackedFloat32Array &special_projected_states,
+    const PackedFloat32Array &codec_pad_embedding,
+    const PackedFloat32Array &codec_prefill_embeddings,
+    int64_t codec_prefill_length,
+    const PackedFloat32Array &speaker_prompt_embedding,
+    const PackedFloat32Array &instruction_projected_states,
+    int64_t instruction_sequence_length,
+    int64_t hidden_size,
+    int64_t wrapped_prefix_token_count,
+    int64_t wrapped_suffix_token_count
+) const {
+    if(text_projected_states.is_empty() || text_sequence_length <= 0 || hidden_size <= 0) {
+        return {};
+    }
+
+    const int64_t first_text_index = wrapped_prefix_token_count;
+    const int64_t trailing_text_start = first_text_index + 1;
+    const int64_t trailing_text_end_exclusive = text_sequence_length - wrapped_suffix_token_count;
+    if(trailing_text_end_exclusive < trailing_text_start) {
+        return {};
+    }
+
+    const PackedFloat32Array role_projected = slice_rows(text_projected_states, 0, wrapped_prefix_token_count, hidden_size);
+    const PackedFloat32Array first_text_projected = slice_rows(text_projected_states, first_text_index, 1, hidden_size);
+    const PackedFloat32Array tts_bos_embedding = slice_rows(special_projected_states, 0, 1, hidden_size);
+    const PackedFloat32Array tts_eos_embedding = slice_rows(special_projected_states, 1, 1, hidden_size);
+    const PackedFloat32Array tts_pad_embedding = slice_rows(special_projected_states, 2, 1, hidden_size);
+    if(tts_bos_embedding.is_empty() || tts_eos_embedding.is_empty() || tts_pad_embedding.is_empty()) {
+        return {};
+    }
+    if(codec_pad_embedding.is_empty() || codec_prefill_embeddings.is_empty() || codec_prefill_length < 2) {
+        return {};
+    }
+
+    const int64_t codec_tag_length = codec_prefill_length - 2;
+    const PackedFloat32Array codec_tag_embeddings = slice_rows(codec_prefill_embeddings, 0, codec_tag_length, hidden_size);
+    const PackedFloat32Array codec_pad_and_bos = slice_rows(codec_prefill_embeddings, codec_tag_length, 2, hidden_size);
+
+    PackedFloat32Array codec_prompt_embeddings = codec_prefill_embeddings;
+    if(!speaker_prompt_embedding.is_empty()) {
+        Array prompt_parts;
+        prompt_parts.append(codec_tag_embeddings);
+        prompt_parts.append(speaker_prompt_embedding);
+        prompt_parts.append(codec_pad_and_bos);
+        codec_prompt_embeddings = concat_rows(prompt_parts);
+    }
+
+    const int64_t codec_prompt_length = codec_prompt_embeddings.size() / std::max<int64_t>(hidden_size, 1);
+    const int64_t codec_core_length = codec_prompt_length - 1;
+    const PackedFloat32Array codec_core_embeddings = slice_rows(codec_prompt_embeddings, 0, codec_core_length, hidden_size);
+    const PackedFloat32Array codec_seed_embedding = slice_rows(codec_prompt_embeddings, codec_prompt_length - 1, 1, hidden_size);
+    const PackedFloat32Array text_pad_repeats = repeat_row(tts_pad_embedding, std::max<int64_t>(codec_prompt_length - 2, 0));
+
+    Array pad_parts;
+    pad_parts.append(text_pad_repeats);
+    pad_parts.append(tts_bos_embedding);
+    const PackedFloat32Array talker_pad_plus_bos = concat_rows(pad_parts);
+    const PackedFloat32Array prefill_core_states = add_vectors(talker_pad_plus_bos, codec_core_embeddings);
+    if(prefill_core_states.is_empty()) {
+        return {};
+    }
+
+    PackedFloat32Array instruction_prompt_states;
+    if(instruction_sequence_length > 0) {
+        instruction_prompt_states = instruction_projected_states;
+    }
+
+    const int64_t trailing_text_count = trailing_text_end_exclusive - trailing_text_start;
+    PackedFloat32Array trailing_text_projected;
+    if(trailing_text_count > 0) {
+        trailing_text_projected = slice_rows(text_projected_states, trailing_text_start, trailing_text_count, hidden_size);
+    }
+
+    Array trailing_parts;
+    trailing_parts.append(trailing_text_projected);
+    trailing_parts.append(tts_eos_embedding);
+    const PackedFloat32Array trailing_text_hidden = concat_rows(trailing_parts);
+    const PackedFloat32Array first_generation_state = add_vectors(first_text_projected, codec_seed_embedding);
+    if(trailing_text_hidden.is_empty() || first_generation_state.is_empty()) {
+        return {};
+    }
+
+    Array language_parts;
+    language_parts.append(instruction_prompt_states);
+    language_parts.append(role_projected);
+    language_parts.append(prefill_core_states);
+    language_parts.append(first_generation_state);
+    const PackedFloat32Array initial_language_inputs = concat_rows(language_parts);
+    const int64_t initial_sequence_length = initial_language_inputs.size() / std::max<int64_t>(hidden_size, 1);
+
+    Dictionary payload;
+    payload["language_sequence"] = initial_language_inputs;
+    payload["language_sequence_length"] = initial_sequence_length;
+    payload["trailing_text_hidden"] = trailing_text_hidden;
+    payload["trailing_text_length"] = trailing_text_hidden.size() / std::max<int64_t>(hidden_size, 1);
+    payload["tts_pad_embedding"] = tts_pad_embedding;
+    payload["hidden_size"] = hidden_size;
+    payload["produced_frames"] = 0;
+    return payload;
+}
+
+} // namespace godot

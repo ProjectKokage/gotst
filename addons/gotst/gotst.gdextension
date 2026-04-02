@@ -1,0 +1,20 @@
+[configuration]
+entry_symbol = "gotst_library_init"
+compatibility_minimum = "4.6"
+reloadable = true
+
+[libraries]
+linux.debug.x86_64 = "res://addons/gotst/bin/libgotst.linux.template_debug.x86_64.so"
+linux.release.x86_64 = "res://addons/gotst/bin/libgotst.linux.template_release.x86_64.so"
+windows.debug.x86_64 = "res://addons/gotst/bin/gotst.windows.template_debug.x86_64.dll"
+windows.release.x86_64 = "res://addons/gotst/bin/gotst.windows.template_release.x86_64.dll"
+macos.debug = "res://addons/gotst/bin/libgotst.macos.template_debug.universal.dylib"
+macos.release = "res://addons/gotst/bin/libgotst.macos.template_release.universal.dylib"
+
+[dependencies]
+linux.debug.x86_64 = {"res://addons/gotst/bin/libonnxruntime.so": ""}
+linux.release.x86_64 = {"res://addons/gotst/bin/libonnxruntime.so": ""}
+windows.debug.x86_64 = {"res://addons/gotst/bin/onnxruntime.dll": ""}
+windows.release.x86_64 = {"res://addons/gotst/bin/onnxruntime.dll": ""}
+macos.debug = {"res://addons/gotst/bin/libonnxruntime.dylib": ""}
+macos.release = {"res://addons/gotst/bin/libonnxruntime.dylib": ""}

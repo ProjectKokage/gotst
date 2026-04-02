@@ -1,0 +1,3 @@
+build/
+addons/gotst/bin/
+compile_commands.json
