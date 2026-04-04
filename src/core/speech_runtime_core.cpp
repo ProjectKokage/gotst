@@ -77,6 +77,24 @@ BackendSummary SpeechRuntimeCore::inspect(const RuntimeConfig &config) const {
             file_exists(config.tts.audio_decoder_model_path) &&
             file_exists(config.tts.talker_model_path) &&
             file_exists(config.tts.predictor_model_path);
+
+        if(!config.tts.speaker_encoder_model_path.empty()) {
+            append_missing_if_needed(
+                "tts_speaker_encoder_model_path",
+                config.tts.speaker_encoder_model_path,
+                summary.missing_paths
+            );
+            summary.speaker_encoder_ready = file_exists(config.tts.speaker_encoder_model_path);
+        }
+
+        if(!config.tts.speech_tokenizer_encoder_model_path.empty()) {
+            append_missing_if_needed(
+                "tts_speech_tokenizer_encoder_model_path",
+                config.tts.speech_tokenizer_encoder_model_path,
+                summary.missing_paths
+            );
+            summary.speech_tokenizer_encoder_ready = file_exists(config.tts.speech_tokenizer_encoder_model_path);
+        }
     }
 
     summary.notes.emplace_back("Scaffold only: gotst does not load models or run inference yet.");
