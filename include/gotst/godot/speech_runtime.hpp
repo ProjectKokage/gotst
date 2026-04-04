@@ -1,6 +1,8 @@
 #pragma once
 
 #include "gotst/core/speech_runtime_core.hpp"
+#include "gotst/core/speech_encoder_session.hpp"
+#include "gotst/core/language_config.hpp"
 
 #include <godot_cpp/classes/ref_counted.hpp>
 #include <godot_cpp/classes/ref.hpp>
@@ -9,6 +11,9 @@
 #include <godot_cpp/variant/packed_float32_array.hpp>
 #include <godot_cpp/variant/packed_int32_array.hpp>
 #include <godot_cpp/variant/packed_int64_array.hpp>
+
+#include <map>
+#include <memory>
 
 namespace godot {
 
@@ -27,6 +32,35 @@ public:
     PackedInt32Array packed_int32_range(int64_t length) const;
     PackedInt64Array packed_int64_ones(int64_t length) const;
     PackedInt64Array build_triplicate_position_ids(int64_t sequence_length) const;
+
+    bool load_speaker_encoder(const String &model_path);
+    bool is_speaker_encoder_loaded() const;
+    PackedFloat32Array extract_speaker_embedding(
+        const PackedFloat32Array &mel_features,
+        int64_t frames,
+        int64_t mel_dim
+    ) const;
+    Dictionary build_speaker_mel_features(
+        const PackedFloat32Array &waveform,
+        int64_t input_sample_rate,
+        int64_t target_sample_rate,
+        int64_t mel_bins,
+        int64_t fft_size,
+        int64_t hop_length,
+        double fmin,
+        double fmax
+    ) const;
+    PackedFloat32Array compute_speaker_embedding_from_audio(
+        const PackedFloat32Array &waveform,
+        int64_t input_sample_rate
+    ) const;
+    bool load_speech_tokenizer_encoder(const String &model_path);
+    bool is_speech_tokenizer_encoder_loaded() const;
+    Dictionary encode_speech_codes(
+        const PackedFloat32Array &waveform,
+        int64_t input_sample_rate
+    ) const;
+    Dictionary load_voice_clone_fixture(const String &json_path) const;
     PackedFloat32Array slice_rows(
         const PackedFloat32Array &source,
         int64_t start_row,
@@ -100,6 +134,69 @@ public:
         int64_t wrapped_prefix_token_count,
         int64_t wrapped_suffix_token_count
     ) const;
+    Dictionary build_voice_clone_language_input(
+        const PackedFloat32Array &text_projected_states,
+        int64_t text_sequence_length,
+        const PackedFloat32Array &ref_text_projected_states,
+        int64_t ref_text_sequence_length,
+        const PackedFloat32Array &ref_codec_projected_states,
+        int64_t ref_codec_frames,
+        const PackedFloat32Array &special_projected_states,
+        const PackedFloat32Array &codec_pad_embedding,
+        const PackedFloat32Array &codec_prefill_embeddings,
+        int64_t codec_prefill_length,
+        const PackedFloat32Array &speaker_prompt_embedding,
+        const PackedFloat32Array &instruction_projected_states,
+        int64_t instruction_sequence_length,
+        int64_t hidden_size,
+        int64_t wrapped_prefix_token_count,
+        int64_t wrapped_suffix_token_count
+    ) const;
+    Dictionary build_custom_voice_language_input(
+        const PackedFloat32Array &text_projected_states,
+        int64_t text_sequence_length,
+        const PackedFloat32Array &special_projected_states,
+        const PackedFloat32Array &codec_pad_embedding,
+        const PackedFloat32Array &codec_prefill_embeddings,
+        int64_t codec_prefill_length,
+        const PackedFloat32Array &speaker_token_embedding,
+        const PackedFloat32Array &instruction_projected_states,
+        int64_t instruction_sequence_length,
+        int64_t hidden_size,
+        int64_t wrapped_prefix_token_count,
+        int64_t wrapped_suffix_token_count
+    ) const;
+    Dictionary build_voice_design_language_input(
+        const PackedFloat32Array &text_projected_states,
+        int64_t text_sequence_length,
+        const PackedFloat32Array &special_projected_states,
+        const PackedFloat32Array &codec_pad_embedding,
+        const PackedFloat32Array &codec_prefill_embeddings,
+        int64_t codec_prefill_length,
+        const PackedFloat32Array &voice_description_projected_states,
+        int64_t voice_description_sequence_length,
+        int64_t hidden_size,
+        int64_t wrapped_prefix_token_count,
+        int64_t wrapped_suffix_token_count
+    ) const;
+    Dictionary get_custom_voice_speaker_ids(const String &speaker_name) const;
+    Array get_custom_voice_speaker_names() const;
+    bool load_custom_voice_config(const String &json_path);
+
+    Dictionary get_supported_tts_languages() const;
+    int64_t get_tts_language_token_id(const String &language_key) const;
+    PackedInt64Array build_codec_prefix_tokens(
+        int64_t language_token_id,
+        int64_t think_token_id,
+        int64_t nothink_token_id,
+        int64_t think_bos_token_id,
+        int64_t think_eos_token_id,
+        int64_t pad_token_id,
+        int64_t bos_token_id
+    ) const;
+
+    void emit_partial_synthesis(int64_t request_id, const PackedFloat32Array &pcm_chunk, int64_t sample_rate);
+    void emit_partial_transcription(int64_t request_id, const String &partial_text);
 
 protected:
     static void _bind_methods();
@@ -107,6 +204,10 @@ protected:
 private:
     Ref<GotstSpeechRuntimeConfig> config_;
     gotst::SpeechRuntimeCore core_;
+    gotst::LanguageConfig language_config_;
+    std::unique_ptr<gotst::SpeakerEncoderSession> speaker_encoder_;
+    std::unique_ptr<gotst::SpeechTokenizerEncoderSession> speech_tokenizer_encoder_;
+    std::map<std::string, std::vector<int64_t>> custom_voice_speakers_;
 };
 
 } // namespace godot

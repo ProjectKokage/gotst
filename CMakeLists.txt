@@ -92,6 +92,11 @@ endif()
 
 add_library(gotst-core STATIC
     src/core/speech_runtime_core.cpp
+    src/core/speech_encoder_session.cpp
+    src/core/speaker_mel.cpp
+    src/core/tts_prompt_assembly.cpp
+    src/core/language_config.cpp
+    src/core/fft.cpp
 )
 add_library(gotst::core ALIAS gotst-core)
 
@@ -113,6 +118,10 @@ set_target_properties(gotst-core PROPERTIES
     CXX_STANDARD_REQUIRED ON
     POSITION_INDEPENDENT_CODE ON
 )
+
+if(NOT MSVC)
+    target_compile_options(gotst-core PRIVATE -Wall -Wextra)
+endif()
 
 if(GOTST_BUILD_GDEXTENSION)
     add_library(gotst SHARED
@@ -148,6 +157,10 @@ if(GOTST_BUILD_GDEXTENSION)
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/addons/gotst/bin"
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/addons/gotst/bin"
     )
+
+    if(NOT MSVC)
+        target_compile_options(gotst PRIVATE -Wall -Wextra)
+    endif()
 
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         set_target_properties(gotst PROPERTIES
