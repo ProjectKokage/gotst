@@ -379,6 +379,42 @@ void GotstSpeechRuntime::_bind_methods() {
         &GotstSpeechRuntime::emit_partial_transcription
     );
     ClassDB::bind_method(
+        D_METHOD("load_tts_code_generator", "config"),
+        &GotstSpeechRuntime::load_tts_code_generator
+    );
+    ClassDB::bind_method(
+        D_METHOD("is_tts_code_generator_loaded"),
+        &GotstSpeechRuntime::is_tts_code_generator_loaded
+    );
+    ClassDB::bind_method(
+        D_METHOD("generate_tts_codes", "params"),
+        &GotstSpeechRuntime::generate_tts_codes
+    );
+    ClassDB::bind_method(
+        D_METHOD("generate_tts_codes_streaming", "params", "request_id", "chunk_frames"),
+        &GotstSpeechRuntime::generate_tts_codes_streaming
+    );
+    ClassDB::bind_method(
+        D_METHOD("poll_tts_stream"),
+        &GotstSpeechRuntime::poll_tts_stream
+    );
+    ClassDB::bind_method(
+        D_METHOD("cancel_tts_stream"),
+        &GotstSpeechRuntime::cancel_tts_stream
+    );
+    ClassDB::bind_method(
+        D_METHOD("load_asr_token_decoder", "config"),
+        &GotstSpeechRuntime::load_asr_token_decoder
+    );
+    ClassDB::bind_method(
+        D_METHOD("is_asr_token_decoder_loaded"),
+        &GotstSpeechRuntime::is_asr_token_decoder_loaded
+    );
+    ClassDB::bind_method(
+        D_METHOD("decode_asr_tokens", "params"),
+        &GotstSpeechRuntime::decode_asr_tokens
+    );
+    ClassDB::bind_method(
         D_METHOD("load_speaker_encoder", "model_path"),
         &GotstSpeechRuntime::load_speaker_encoder
     );
@@ -1577,7 +1613,7 @@ Dictionary GotstSpeechRuntime::load_voice_clone_fixture(const String &json_path)
         return {};
     }
 
-    const JSON json_parser;
+    JSON json_parser;
     const Error parse_error = json_parser.parse(json_text);
     if (parse_error != OK) {
         return {};
@@ -1884,7 +1920,7 @@ bool GotstSpeechRuntime::load_custom_voice_config(const String &json_path) {
         return false;
     }
 
-    const JSON json_parser;
+    JSON json_parser;
     const Error parse_error = json_parser.parse(json_text);
     if (parse_error != OK) {
         return false;
@@ -1983,6 +2019,276 @@ PackedInt64Array GotstSpeechRuntime::build_codec_prefix_tokens(
     result.resize(static_cast<int64_t>(tokens.size()));
     memcpy(result.ptrw(), tokens.data(), tokens.size() * sizeof(int64_t));
     return result;
+}
+
+bool GotstSpeechRuntime::load_tts_code_generator(const Dictionary &config) {
+    gotst::TtsModelPaths paths;
+    paths.talker_gguf_path = String(config.get("talker_gguf_path", "")).utf8().get_data();
+    paths.predictor_gguf_path = String(config.get("predictor_gguf_path", "")).utf8().get_data();
+    paths.codec_embedding_onnx_path = String(config.get("codec_embedding_onnx_path", "")).utf8().get_data();
+    paths.predictor_embedding_onnx_path = String(config.get("predictor_embedding_onnx_path", "")).utf8().get_data();
+
+    gotst::TtsSessionConfig session_config;
+    session_config.talker_n_ctx = static_cast<int32_t>(config.get("talker_n_ctx", 1024));
+    session_config.talker_n_batch = static_cast<int32_t>(config.get("talker_n_batch", 1024));
+    session_config.predictor_n_ctx = static_cast<int32_t>(config.get("predictor_n_ctx", 128));
+    session_config.predictor_n_batch = static_cast<int32_t>(config.get("predictor_n_batch", 128));
+    session_config.n_threads = static_cast<int32_t>(config.get("n_threads", -1));
+    session_config.n_gpu_layers = static_cast<int32_t>(config.get("n_gpu_layers", 0));
+    session_config.use_mmap = static_cast<bool>(config.get("use_mmap", true));
+    session_config.use_mlock = static_cast<bool>(config.get("use_mlock", false));
+    session_config.flash_attn_type = static_cast<int32_t>(config.get("flash_attn_type", -1));
+    session_config.type_k = static_cast<int32_t>(config.get("type_k", -1));
+    session_config.type_v = static_cast<int32_t>(config.get("type_v", -1));
+    session_config.talker_position_components = static_cast<int32_t>(config.get("talker_position_components", 4));
+    session_config.predictor_position_components = static_cast<int32_t>(config.get("predictor_position_components", 1));
+
+    tts_code_generator_ = std::make_unique<gotst::TtsCodeGenerator>();
+    auto result = tts_code_generator_->load(paths, session_config);
+    if (!result.is_ok()) {
+        ERR_PRINT(String("TTS code generator load failed: ") + String(result.error_message().c_str()));
+        tts_code_generator_.reset();
+        return false;
+    }
+    return true;
+}
+
+bool GotstSpeechRuntime::is_tts_code_generator_loaded() const {
+    return tts_code_generator_ && tts_code_generator_->is_loaded();
+}
+
+Dictionary GotstSpeechRuntime::generate_tts_codes(const Dictionary &params) {
+    Dictionary output;
+    if (!tts_code_generator_ || !tts_code_generator_->is_loaded()) {
+        output["error"] = "TTS code generator is not loaded.";
+        return output;
+    }
+
+    const PackedFloat32Array initial_input = params.get("initial_language_input", PackedFloat32Array());
+    const int32_t initial_length = static_cast<int32_t>(params.get("initial_sequence_length", 0));
+    const PackedFloat32Array trailing_hidden = params.get("trailing_text_hidden", PackedFloat32Array());
+    const int32_t trailing_length = static_cast<int32_t>(params.get("trailing_text_length", 0));
+    const PackedFloat32Array pad_embedding = params.get("tts_pad_embedding", PackedFloat32Array());
+
+    gotst::TtsSamplingConfig sampling;
+    sampling.codebook_size = static_cast<int32_t>(params.get("codebook_size", 2048));
+    sampling.residual_groups = static_cast<int32_t>(params.get("residual_groups", 15));
+    sampling.target_frames = static_cast<int32_t>(params.get("target_frames", 96));
+    sampling.min_frames_before_eos = static_cast<int32_t>(params.get("min_frames_before_eos", 8));
+    sampling.hidden_size = static_cast<int32_t>(params.get("hidden_size", 1024));
+    sampling.eos_token_id = static_cast<int32_t>(params.get("eos_token_id", 2150));
+    sampling.eos_logit_margin = static_cast<float>(params.get("eos_logit_margin", 0.0));
+    sampling.do_sample = static_cast<bool>(params.get("do_sample", true));
+    sampling.top_k = static_cast<int32_t>(params.get("top_k", 50));
+    sampling.top_p = static_cast<float>(params.get("top_p", 1.0));
+    sampling.temperature = static_cast<float>(params.get("temperature", 0.9));
+    sampling.sub_do_sample = static_cast<bool>(params.get("sub_do_sample", true));
+    sampling.sub_top_k = static_cast<int32_t>(params.get("sub_top_k", 50));
+    sampling.sub_top_p = static_cast<float>(params.get("sub_top_p", 1.0));
+    sampling.sub_temperature = static_cast<float>(params.get("sub_temperature", 0.9));
+    sampling.repetition_penalty = static_cast<float>(params.get("repetition_penalty", 1.05));
+    sampling.rng_seed = static_cast<int64_t>(params.get("rng_seed", 1));
+
+    auto result = tts_code_generator_->generate(
+        {initial_input.ptr(), static_cast<size_t>(initial_input.size())},
+        initial_length,
+        {trailing_hidden.ptr(), static_cast<size_t>(trailing_hidden.size())},
+        trailing_length,
+        {pad_embedding.ptr(), static_cast<size_t>(pad_embedding.size())},
+        sampling
+    );
+
+    if (!result.is_ok()) {
+        output["error"] = String(result.error_message().c_str());
+        return output;
+    }
+
+    const auto &gen = result.value();
+    PackedInt64Array codes;
+    codes.resize(static_cast<int64_t>(gen.codes.size()));
+    if (!gen.codes.empty()) {
+        memcpy(codes.ptrw(), gen.codes.data(), gen.codes.size() * sizeof(int64_t));
+    }
+
+    output["codes"] = codes;
+    output["frame_count"] = gen.frame_count;
+    output["codes_per_frame"] = gen.codes_per_frame;
+    return output;
+}
+
+Dictionary GotstSpeechRuntime::generate_tts_codes_streaming(const Dictionary &params, int64_t request_id, int64_t chunk_frames) {
+    Dictionary output;
+    if (!tts_code_generator_ || !tts_code_generator_->is_loaded()) {
+        output["error"] = "TTS code generator is not loaded.";
+        return output;
+    }
+
+    stream_cancel_.reset();
+    stream_active_.store(true, std::memory_order_release);
+
+    const PackedFloat32Array initial_input = params.get("initial_language_input", PackedFloat32Array());
+    const int32_t initial_length = static_cast<int32_t>(params.get("initial_sequence_length", 0));
+    const PackedFloat32Array trailing_hidden = params.get("trailing_text_hidden", PackedFloat32Array());
+    const int32_t trailing_length = static_cast<int32_t>(params.get("trailing_text_length", 0));
+    const PackedFloat32Array pad_embedding = params.get("tts_pad_embedding", PackedFloat32Array());
+
+    gotst::TtsSamplingConfig sampling;
+    sampling.codebook_size = static_cast<int32_t>(params.get("codebook_size", 2048));
+    sampling.residual_groups = static_cast<int32_t>(params.get("residual_groups", 15));
+    sampling.target_frames = static_cast<int32_t>(params.get("target_frames", 96));
+    sampling.min_frames_before_eos = static_cast<int32_t>(params.get("min_frames_before_eos", 8));
+    sampling.hidden_size = static_cast<int32_t>(params.get("hidden_size", 1024));
+    sampling.eos_token_id = static_cast<int32_t>(params.get("eos_token_id", 2150));
+    sampling.eos_logit_margin = static_cast<float>(params.get("eos_logit_margin", 0.0));
+    sampling.do_sample = static_cast<bool>(params.get("do_sample", true));
+    sampling.top_k = static_cast<int32_t>(params.get("top_k", 50));
+    sampling.top_p = static_cast<float>(params.get("top_p", 1.0));
+    sampling.temperature = static_cast<float>(params.get("temperature", 0.9));
+    sampling.sub_do_sample = static_cast<bool>(params.get("sub_do_sample", true));
+    sampling.sub_top_k = static_cast<int32_t>(params.get("sub_top_k", 50));
+    sampling.sub_top_p = static_cast<float>(params.get("sub_top_p", 1.0));
+    sampling.sub_temperature = static_cast<float>(params.get("sub_temperature", 0.9));
+    sampling.repetition_penalty = static_cast<float>(params.get("repetition_penalty", 1.05));
+    sampling.rng_seed = static_cast<int64_t>(params.get("rng_seed", 1));
+
+    auto on_chunk = [this, request_id](gotst::TtsFrameChunk chunk) {
+        StreamEvent event;
+        event.request_id = request_id;
+        event.frame_count = chunk.frame_count;
+        event.codes_per_frame = chunk.codes_per_frame;
+        event.is_final = chunk.is_final;
+        event.codes.resize(static_cast<int64_t>(chunk.codes.size()));
+        if (!chunk.codes.empty()) {
+            memcpy(event.codes.ptrw(), chunk.codes.data(), chunk.codes.size() * sizeof(int64_t));
+        }
+        std::lock_guard<std::mutex> lock(stream_mutex_);
+        stream_queue_.push(std::move(event));
+    };
+
+    auto result = tts_code_generator_->generate_streaming(
+        {initial_input.ptr(), static_cast<size_t>(initial_input.size())},
+        initial_length,
+        {trailing_hidden.ptr(), static_cast<size_t>(trailing_hidden.size())},
+        trailing_length,
+        {pad_embedding.ptr(), static_cast<size_t>(pad_embedding.size())},
+        sampling,
+        static_cast<int32_t>(chunk_frames),
+        on_chunk,
+        &stream_cancel_
+    );
+
+    stream_active_.store(false, std::memory_order_release);
+
+    if (!result.is_ok()) {
+        StreamEvent err_event;
+        err_event.request_id = request_id;
+        err_event.is_error = true;
+        err_event.error_message = String(result.error_message().c_str());
+        std::lock_guard<std::mutex> lock(stream_mutex_);
+        stream_queue_.push(std::move(err_event));
+
+        output["error"] = String(result.error_message().c_str());
+        return output;
+    }
+
+    const auto &gen = result.value();
+    output["frame_count"] = gen.frame_count;
+    output["codes_per_frame"] = gen.codes_per_frame;
+    return output;
+}
+
+Array GotstSpeechRuntime::poll_tts_stream() {
+    Array events;
+    std::lock_guard<std::mutex> lock(stream_mutex_);
+    while (!stream_queue_.empty()) {
+        StreamEvent &ev = stream_queue_.front();
+        Dictionary d;
+        d["request_id"] = ev.request_id;
+        d["codes"] = ev.codes;
+        d["frame_count"] = ev.frame_count;
+        d["codes_per_frame"] = ev.codes_per_frame;
+        d["is_final"] = ev.is_final;
+        if (ev.is_error) {
+            d["error"] = ev.error_message;
+        }
+        events.push_back(d);
+        stream_queue_.pop();
+    }
+    return events;
+}
+
+void GotstSpeechRuntime::cancel_tts_stream() {
+    stream_cancel_.cancel();
+    stream_active_.store(false, std::memory_order_release);
+}
+
+bool GotstSpeechRuntime::load_asr_token_decoder(const Dictionary &config) {
+    gotst::AsrModelPaths paths;
+    paths.thinker_gguf_path = String(config.get("thinker_gguf_path", "")).utf8().get_data();
+    paths.embedding_onnx_path = String(config.get("embedding_onnx_path", "")).utf8().get_data();
+
+    gotst::AsrSessionConfig session_config;
+    session_config.n_ctx = static_cast<int32_t>(config.get("n_ctx", 1024));
+    session_config.n_batch = static_cast<int32_t>(config.get("n_batch", 1024));
+    session_config.n_threads = static_cast<int32_t>(config.get("n_threads", -1));
+    session_config.n_gpu_layers = static_cast<int32_t>(config.get("n_gpu_layers", 0));
+    session_config.use_mmap = static_cast<bool>(config.get("use_mmap", true));
+    session_config.use_mlock = static_cast<bool>(config.get("use_mlock", false));
+    session_config.flash_attn_type = static_cast<int32_t>(config.get("flash_attn_type", -1));
+    session_config.type_k = static_cast<int32_t>(config.get("type_k", -1));
+    session_config.type_v = static_cast<int32_t>(config.get("type_v", -1));
+    session_config.position_components = static_cast<int32_t>(config.get("position_components", 3));
+
+    asr_token_decoder_ = std::make_unique<gotst::AsrTokenDecoder>();
+    auto result = asr_token_decoder_->load(paths, session_config);
+    if (!result.is_ok()) {
+        ERR_PRINT(String("ASR token decoder load failed: ") + String(result.error_message().c_str()));
+        asr_token_decoder_.reset();
+        return false;
+    }
+    return true;
+}
+
+bool GotstSpeechRuntime::is_asr_token_decoder_loaded() const {
+    return asr_token_decoder_ && asr_token_decoder_->is_loaded();
+}
+
+Dictionary GotstSpeechRuntime::decode_asr_tokens(const Dictionary &params) {
+    Dictionary output;
+    if (!asr_token_decoder_ || !asr_token_decoder_->is_loaded()) {
+        output["error"] = "ASR token decoder is not loaded.";
+        return output;
+    }
+
+    const PackedFloat32Array prompt_embeddings = params.get("prompt_embeddings", PackedFloat32Array());
+    const int32_t prompt_length = static_cast<int32_t>(params.get("prompt_length", 0));
+
+    gotst::AsrDecodeParams decode_params;
+    decode_params.max_tokens = static_cast<int32_t>(params.get("max_tokens", 64));
+    decode_params.hidden_size = static_cast<int32_t>(params.get("hidden_size", 896));
+    decode_params.vocab_size = static_cast<int32_t>(params.get("vocab_size", 152064));
+    decode_params.eos_token_id = static_cast<int32_t>(params.get("eos_token_id", 151645));
+
+    auto result = asr_token_decoder_->decode(
+        {prompt_embeddings.ptr(), static_cast<size_t>(prompt_embeddings.size())},
+        prompt_length,
+        decode_params
+    );
+
+    if (!result.is_ok()) {
+        output["error"] = String(result.error_message().c_str());
+        return output;
+    }
+
+    const auto &decoded = result.value();
+    PackedInt32Array token_ids;
+    token_ids.resize(static_cast<int64_t>(decoded.token_ids.size()));
+    if (!decoded.token_ids.empty()) {
+        memcpy(token_ids.ptrw(), decoded.token_ids.data(), decoded.token_ids.size() * sizeof(int32_t));
+    }
+
+    output["token_ids"] = token_ids;
+    return output;
 }
 
 } // namespace godot

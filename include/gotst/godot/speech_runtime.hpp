@@ -2,6 +2,8 @@
 
 #include "gotst/core/speech_runtime_core.hpp"
 #include "gotst/core/speech_encoder_session.hpp"
+#include "gotst/core/tts_code_generator.hpp"
+#include "gotst/core/asr_token_decoder.hpp"
 #include "gotst/core/language_config.hpp"
 
 #include <godot_cpp/classes/ref_counted.hpp>
@@ -12,8 +14,11 @@
 #include <godot_cpp/variant/packed_int32_array.hpp>
 #include <godot_cpp/variant/packed_int64_array.hpp>
 
+#include <atomic>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <queue>
 
 namespace godot {
 
@@ -198,6 +203,17 @@ public:
     void emit_partial_synthesis(int64_t request_id, const PackedFloat32Array &pcm_chunk, int64_t sample_rate);
     void emit_partial_transcription(int64_t request_id, const String &partial_text);
 
+    bool load_tts_code_generator(const Dictionary &config);
+    bool is_tts_code_generator_loaded() const;
+    Dictionary generate_tts_codes(const Dictionary &params);
+    Dictionary generate_tts_codes_streaming(const Dictionary &params, int64_t request_id, int64_t chunk_frames);
+    Array poll_tts_stream();
+    void cancel_tts_stream();
+
+    bool load_asr_token_decoder(const Dictionary &config);
+    bool is_asr_token_decoder_loaded() const;
+    Dictionary decode_asr_tokens(const Dictionary &params);
+
 protected:
     static void _bind_methods();
 
@@ -207,7 +223,24 @@ private:
     gotst::LanguageConfig language_config_;
     std::unique_ptr<gotst::SpeakerEncoderSession> speaker_encoder_;
     std::unique_ptr<gotst::SpeechTokenizerEncoderSession> speech_tokenizer_encoder_;
+    std::unique_ptr<gotst::TtsCodeGenerator> tts_code_generator_;
+    std::unique_ptr<gotst::AsrTokenDecoder> asr_token_decoder_;
     std::map<std::string, std::vector<int64_t>> custom_voice_speakers_;
+
+    struct StreamEvent {
+        int64_t request_id = 0;
+        PackedInt64Array codes;
+        int32_t frame_count = 0;
+        int32_t codes_per_frame = 0;
+        bool is_final = false;
+        bool is_error = false;
+        String error_message;
+    };
+
+    std::mutex stream_mutex_;
+    std::queue<StreamEvent> stream_queue_;
+    std::atomic<bool> stream_active_{false};
+    gotst::CancellationToken stream_cancel_;
 };
 
 } // namespace godot
