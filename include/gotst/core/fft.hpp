@@ -17,6 +17,11 @@ struct FftWorkspace {
     std::vector<double> imag_in;
     std::vector<double> real_out;
     std::vector<double> imag_out;
+    std::vector<int64_t> bit_reverse_indices;
+    std::vector<double> stage_twiddle_real;
+    std::vector<double> stage_twiddle_imag;
+    int64_t plan_size = 0;
+    int64_t plan_log2n = 0;
 
     void resize(int64_t padded_size);
 };

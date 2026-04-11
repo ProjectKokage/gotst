@@ -175,3 +175,42 @@ TEST_CASE("compute_power_spectrum_fft handles negative offset with reflection", 
     }
     REQUIRE(has_nonzero);
 }
+
+TEST_CASE("compute_power_spectrum_fft reuses workspace without changing results", "[fft]") {
+    constexpr int64_t N = 128;
+    const int64_t freq_bins = N / 2 + 1;
+    std::vector<float> samples(static_cast<size_t>(N));
+    for (int64_t i = 0; i < N; ++i) {
+        samples[static_cast<size_t>(i)] = static_cast<float>(
+            std::sin(2.0 * M_PI * 220.0 * static_cast<double>(i) / 16000.0)
+        );
+    }
+    std::vector<float> window(static_cast<size_t>(N), 1.0f);
+    std::vector<float> reference(static_cast<size_t>(freq_bins));
+    std::vector<float> reused_first(static_cast<size_t>(freq_bins));
+    std::vector<float> reused_second(static_cast<size_t>(freq_bins));
+    gotst::FftWorkspace workspace;
+
+    gotst::compute_power_spectrum_fft(
+        samples.data(), N, 0, freq_bins, window.data(), N, reference.data()
+    );
+    gotst::compute_power_spectrum_fft(
+        samples.data(), N, 0, freq_bins, window.data(), N, reused_first.data(), &workspace
+    );
+    gotst::compute_power_spectrum_fft(
+        samples.data(), N, 16, freq_bins, window.data(), N, reused_second.data(), &workspace
+    );
+
+    for (int64_t bin = 0; bin < freq_bins; ++bin) {
+        CHECK(reused_first[static_cast<size_t>(bin)] == Approx(reference[static_cast<size_t>(bin)]).margin(1e-6f));
+    }
+
+    bool changed_with_offset = false;
+    for (int64_t bin = 0; bin < freq_bins; ++bin) {
+        if (std::abs(reused_second[static_cast<size_t>(bin)] - reused_first[static_cast<size_t>(bin)]) > 1e-6f) {
+            changed_with_offset = true;
+            break;
+        }
+    }
+    REQUIRE(changed_with_offset);
+}

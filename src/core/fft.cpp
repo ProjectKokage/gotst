@@ -36,14 +36,23 @@ int64_t next_power_of_two(int64_t n) {
     return p;
 }
 
-void bit_reverse_copy(const double *src_real, const double *src_imag, int64_t n, int64_t log2n, double *dst_real, double *dst_imag) {
+int64_t compute_log2_size(int64_t n) {
+    int64_t log2n = 0;
+    while (n > 1) {
+        n >>= 1;
+        ++log2n;
+    }
+    return log2n;
+}
+
+void bit_reverse_copy(const double *src_real,
+                      const double *src_imag,
+                      const std::vector<int64_t> &bit_reverse_indices,
+                      double *dst_real,
+                      double *dst_imag) {
+    const int64_t n = static_cast<int64_t>(bit_reverse_indices.size());
     for (int64_t i = 0; i < n; ++i) {
-        int64_t rev = 0;
-        int64_t val = i;
-        for (int64_t bit = 0; bit < log2n; ++bit) {
-            rev = (rev << 1) | (val & 1);
-            val >>= 1;
-        }
+        const int64_t rev = bit_reverse_indices[static_cast<size_t>(i)];
         dst_real[rev] = src_real[i];
         dst_imag[rev] = src_imag[i];
     }
@@ -59,23 +68,15 @@ void radix2_fft(const double *input_real, const double *input_imag, int64_t n, d
         return;
     }
 
-    int64_t log2n = 0;
-    {
-        int64_t temp = n;
-        while (temp > 1) {
-            temp >>= 1;
-            ++log2n;
-        }
-    }
+    FftWorkspace workspace;
+    workspace.resize(n);
+    bit_reverse_copy(input_real, input_imag, workspace.bit_reverse_indices, output_real, output_imag);
 
-    bit_reverse_copy(input_real, input_imag, n, log2n, output_real, output_imag);
-
-    for (int64_t stage = 1; stage <= log2n; ++stage) {
+    for (int64_t stage = 1; stage <= workspace.plan_log2n; ++stage) {
         const int64_t m = 1LL << stage;
         const int64_t half_m = m >> 1;
-        const double angle = -2.0 * PI / static_cast<double>(m);
-        const double wm_real = std::cos(angle);
-        const double wm_imag = std::sin(angle);
+        const double wm_real = workspace.stage_twiddle_real[static_cast<size_t>(stage)];
+        const double wm_imag = workspace.stage_twiddle_imag[static_cast<size_t>(stage)];
 
         for (int64_t k = 0; k < n; k += m) {
             double w_real = 1.0;
@@ -104,6 +105,32 @@ void FftWorkspace::resize(int64_t padded_size) {
         imag_in.resize(n);
         real_out.resize(n);
         imag_out.resize(n);
+    }
+
+    if (plan_size == padded_size) {
+        return;
+    }
+
+    plan_size = padded_size;
+    plan_log2n = compute_log2_size(padded_size);
+    bit_reverse_indices.resize(n);
+    for (int64_t index = 0; index < padded_size; ++index) {
+        int64_t reversed = 0;
+        int64_t value = index;
+        for (int64_t bit = 0; bit < plan_log2n; ++bit) {
+            reversed = (reversed << 1) | (value & 1);
+            value >>= 1;
+        }
+        bit_reverse_indices[static_cast<size_t>(index)] = reversed;
+    }
+
+    stage_twiddle_real.resize(static_cast<size_t>(plan_log2n + 1));
+    stage_twiddle_imag.resize(static_cast<size_t>(plan_log2n + 1));
+    for (int64_t stage = 1; stage <= plan_log2n; ++stage) {
+        const int64_t m = 1LL << stage;
+        const double angle = -2.0 * PI / static_cast<double>(m);
+        stage_twiddle_real[static_cast<size_t>(stage)] = std::cos(angle);
+        stage_twiddle_imag[static_cast<size_t>(stage)] = std::sin(angle);
     }
 }
 
@@ -140,7 +167,42 @@ void compute_power_spectrum_fft(
         ws.real_in[static_cast<size_t>(si)] = sample * window[static_cast<size_t>(si)];
     }
 
-    radix2_fft(ws.real_in.data(), ws.imag_in.data(), padded_size, ws.real_out.data(), ws.imag_out.data());
+    bit_reverse_copy(
+        ws.real_in.data(),
+        ws.imag_in.data(),
+        ws.bit_reverse_indices,
+        ws.real_out.data(),
+        ws.imag_out.data()
+    );
+
+    for (int64_t stage = 1; stage <= ws.plan_log2n; ++stage) {
+        const int64_t m = 1LL << stage;
+        const int64_t half_m = m >> 1;
+        const double wm_real = ws.stage_twiddle_real[static_cast<size_t>(stage)];
+        const double wm_imag = ws.stage_twiddle_imag[static_cast<size_t>(stage)];
+
+        for (int64_t k = 0; k < padded_size; k += m) {
+            double w_real = 1.0;
+            double w_imag = 0.0;
+            for (int64_t j = 0; j < half_m; ++j) {
+                const int64_t even = k + j;
+                const int64_t odd = k + j + half_m;
+                const double t_real = w_real * ws.real_out[static_cast<size_t>(odd)] -
+                                      w_imag * ws.imag_out[static_cast<size_t>(odd)];
+                const double t_imag = w_real * ws.imag_out[static_cast<size_t>(odd)] +
+                                      w_imag * ws.real_out[static_cast<size_t>(odd)];
+                ws.real_out[static_cast<size_t>(odd)] =
+                    ws.real_out[static_cast<size_t>(even)] - t_real;
+                ws.imag_out[static_cast<size_t>(odd)] =
+                    ws.imag_out[static_cast<size_t>(even)] - t_imag;
+                ws.real_out[static_cast<size_t>(even)] += t_real;
+                ws.imag_out[static_cast<size_t>(even)] += t_imag;
+                const double next_w_real = w_real * wm_real - w_imag * wm_imag;
+                w_imag = w_real * wm_imag + w_imag * wm_real;
+                w_real = next_w_real;
+            }
+        }
+    }
 
     const int64_t usable_bins = (freq_bins <= padded_size / 2 + 1) ? freq_bins : padded_size / 2 + 1;
     for (int64_t freq = 0; freq < usable_bins; ++freq) {
