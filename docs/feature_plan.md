@@ -1,5 +1,9 @@
 # gotst Feature Completeness Plan
 
+> **Status: Complete (2026-04).** All phases described below have been implemented and tested.
+> This document is preserved as historical design context. See `AGENTS.md` for the current
+> contract and `README.md` for the current API surface.
+
 ## Purpose
 
 Make `gotst` feature-complete for all Qwen3-ASR and Qwen3-TTS capabilities, with first-class
@@ -10,10 +14,11 @@ complete" means, what gaps exist today, and a phased implementation plan.
 
 ## Current State
 
-`gotst` (v0.1.0) provides native C++ GDExtension kernels for the **hot loops** of the Qwen3-ASR
-and Qwen3-TTS hybrid runtime. It does **not** load models, manage sessions, or own pipeline
-orchestration. The GDScript layer (`qwen_asr_client.gd`, `qwen_tts_client.gd`) owns session
-management, prompt construction, and the autoregressive generation loop.
+`gotst` provides native C++ GDExtension kernels for the Qwen3-ASR and Qwen3-TTS hybrid runtime.
+It owns speech-specific DSP, feature extraction, ONNX session management for speech models,
+prompt assembly for all voice modes, streaming/cancellation, and multi-language support.
+The GDScript layer (`qwen_asr_client.gd`, `qwen_tts_client.gd`) owns session orchestration
+and the autoregressive generation loop.
 
 ### What is implemented
 
@@ -29,18 +34,20 @@ management, prompt construction, and the autoregressive generation loop.
 | Validation | NaN/Inf guard | `contains_only_finite_values` |
 | Backend check | Config path validation and dependency probing | `inspect_backends` |
 
-### What is NOT implemented
+### Implementation status (updated 2026-04)
 
-| Category | Gap |
-|----------|-----|
-| VoiceClone | No speaker encoder pipeline, no speech tokenizer encoder, no ICL prompt assembly, no ref_code handling |
-| VoiceDesign | No voice description prompt construction, no voice design language input |
-| CustomVoice | No speaker name-to-token-ID lookup, no preset speaker embedding |
-| Streaming | No incremental audio emission, no partial transcription, no cancellation tokens |
-| Multi-language | Japanese hardcoded in TTS; ASR language hint not wired into model |
-| Session ownership | gotst does not own ONNX sessions for `speaker_encoder` or `speech_tokenizer_encoder` |
-| Tests | Only backend inspection tested; no DSP/sampling/prompt tests |
-| SIMD | DFT is O(N^2); no FFT optimization |
+All categories from the original gap analysis have been implemented:
+
+| Category | Status | Implementation |
+|----------|--------|----------------|
+| VoiceClone | Done | `speech_encoder_session.cpp`, `speaker_mel.cpp`, `tts_prompt_assembly.cpp` |
+| VoiceDesign | Done | `tts_prompt_assembly.cpp` (`build_voice_design_language_input`) |
+| CustomVoice | Done | `tts_prompt_assembly.cpp` (`load_custom_voice_config`, speaker lookup) |
+| Streaming | Done | `tts_code_generator.cpp`, `cancellation_token.hpp` |
+| Multi-language | Done | `language_config.cpp` (10 TTS languages, codec prefix construction) |
+| Session ownership | Done | `speech_encoder_session.cpp` (SpeakerEncoder + SpeechTokenizerEncoder) |
+| Tests | Done | 12 test files, 165 test cases (Catch2) |
+| FFT | Done | `fft.cpp` (replaces O(N^2) DFT) |
 
 ### Voice mode support matrix
 
@@ -886,7 +893,7 @@ Phase 6 depends on at least one voice mode being complete. Phase 8 is last.
 
 ---
 
-## File Structure (Target)
+## File Structure (implemented)
 
 ```
 include/gotst/
