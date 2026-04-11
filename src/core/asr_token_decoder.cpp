@@ -1,13 +1,14 @@
 #include "gotst/core/asr_token_decoder.hpp"
+#include "core/onnx_embedding_utils.hpp"
 
 #include <godot_llama/llama_context_handle.hpp>
 #include <godot_llama/llama_model_handle.hpp>
 #include <godot_llama/llama_params.hpp>
 #include <godot_llama/llama_position_layout.hpp>
 #include <gonx/core/session.hpp>
-#include <gonx/core/type_conversion.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -100,6 +101,7 @@ Result<AsrDecodeResult> AsrTokenDecoder::decode(
     std::vector<int32_t> base_positions(prompt_length);
     std::iota(base_positions.begin(), base_positions.end(), 0);
     std::vector<int32_t> positions;
+    positions.reserve(static_cast<size_t>(prompt_length) * static_cast<size_t>(pos_components));
     auto pos_err = godot_llama::normalize_position_layout(base_positions, prompt_length, pos_components, positions);
     if (pos_err) {
         return Error::inference_failed("ASR position layout failed: " + pos_err.message);
@@ -116,7 +118,12 @@ Result<AsrDecodeResult> AsrTokenDecoder::decode(
     }
 
     AsrDecodeResult result;
+    result.token_ids.reserve(static_cast<size_t>(std::max(params.max_tokens, 0)));
     int32_t current_length = prompt_length;
+    detail::SingleTokenEmbeddingRunScratch onnx_scratch;
+    std::array<int32_t, 1> next_base_position = {0};
+    std::vector<int32_t> next_positions;
+    next_positions.reserve(static_cast<size_t>(std::max(pos_components, 0)));
 
     for (int32_t step = 0; step < params.max_tokens; ++step) {
         if (cancel && cancel->is_cancelled()) {
@@ -149,30 +156,18 @@ Result<AsrDecodeResult> AsrTokenDecoder::decode(
 
         // Get embedding for the decoded token via ONNX.
         auto t_emb = Clock::now();
-        std::vector<int64_t> token_ids = {static_cast<int64_t>(best_token)};
-        std::vector<int64_t> id_shape = {1, 1};
-        auto id_tensor = gonx::create_int64_tensor(token_ids, id_shape);
-        if (id_tensor.has_error()) {
-            return Error::inference_failed("Failed to create token tensor at step " + std::to_string(step));
+        auto embedding_run = detail::run_single_token_float_embedding(
+            impl_->embedding,
+            onnx_scratch,
+            static_cast<int64_t>(best_token)
+        );
+        if (!embedding_run.is_ok()) {
+            return Error::inference_failed(
+                "Embedding ONNX failed at step " + std::to_string(step) + ": " + embedding_run.error_message()
+            );
         }
 
-        std::vector<Ort::Value> inputs;
-        inputs.push_back(std::move(id_tensor).value());
-        auto run_result = impl_->embedding.run(inputs);
-        if (run_result.has_error()) {
-            return Error::inference_failed("Embedding ONNX failed at step " + std::to_string(step));
-        }
-
-        auto &outputs = run_result.value();
-        if (outputs.empty()) {
-            return Error::inference_failed("Embedding ONNX returned empty at step " + std::to_string(step));
-        }
-
-        const float *emb_data = outputs[0].GetTensorData<float>();
-        auto emb_shape = gonx::get_tensor_shape(outputs[0]);
-        int64_t emb_total = 1;
-        for (auto d : emb_shape) emb_total *= d;
-        if (emb_total < hidden_size) {
+        if (embedding_run.value().values.size() < static_cast<size_t>(hidden_size)) {
             return Error::inference_failed("Embedding too small at step " + std::to_string(step));
         }
 
@@ -180,12 +175,22 @@ Result<AsrDecodeResult> AsrTokenDecoder::decode(
 
         // Incremental thinker decode: feed only the new token embedding.
         auto t_dec = Clock::now();
-        std::vector<int32_t> next_base_pos = {current_length};
-        std::vector<int32_t> next_pos;
-        godot_llama::normalize_position_layout(next_base_pos, 1, pos_components, next_pos);
+        next_base_position[0] = current_length;
+        auto next_pos_err = godot_llama::normalize_position_layout(
+            next_base_position,
+            1,
+            pos_components,
+            next_positions
+        );
+        if (next_pos_err) {
+            return Error::inference_failed(
+                "ASR next position layout failed at step " + std::to_string(step) + ": " + next_pos_err.message
+            );
+        }
+
         auto incr_err = impl_->thinker_ctx.decode_embeddings(
-            {emb_data, static_cast<size_t>(hidden_size)},
-            1, hidden_size, next_pos, pos_components
+            embedding_run.value().values.first(static_cast<size_t>(hidden_size)),
+            1, hidden_size, next_positions, pos_components
         );
         ms_decode += Ms(Clock::now() - t_dec).count();
         if (!incr_err.ok()) {

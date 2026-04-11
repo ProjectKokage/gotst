@@ -106,6 +106,19 @@ public:
     );
 
 private:
+    Result<TtsGenerateResult> run_generation_impl(
+        std::span<const float> initial_language_input,
+        int32_t initial_sequence_length,
+        std::span<const float> trailing_text_hidden,
+        int32_t trailing_text_length,
+        std::span<const float> tts_pad_embedding,
+        const TtsSamplingConfig &params,
+        int32_t chunk_frames,
+        FrameChunkCallback on_chunk,
+        CancellationToken *cancel,
+        const char *log_tag
+    );
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
