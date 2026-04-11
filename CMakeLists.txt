@@ -93,6 +93,7 @@ endif()
 add_library(gotst-core STATIC
     src/core/speech_runtime_core.cpp
     src/core/speech_encoder_session.cpp
+    src/core/asr_frontend.cpp
     src/core/speaker_mel.cpp
     src/core/tts_prompt_assembly.cpp
     src/core/tts_code_generator.cpp

@@ -11,6 +11,7 @@ FetchContent_MakeAvailable(Catch2)
 set(GOTST_TEST_FIXTURES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../fixtures")
 
 add_executable(gotst_unit_tests
+    test_asr_frontend.cpp
     test_speech_runtime_core.cpp
     test_speech_encoder_session.cpp
     test_speaker_mel.cpp
