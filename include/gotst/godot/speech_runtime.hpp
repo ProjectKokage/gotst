@@ -3,6 +3,7 @@
 #include "gotst/core/speech_runtime_core.hpp"
 #include "gotst/core/speech_encoder_session.hpp"
 #include "gotst/core/tts_code_generator.hpp"
+#include "gotst/core/tts_waveform_decoder.hpp"
 #include "gotst/core/asr_token_decoder.hpp"
 #include "gotst/core/language_config.hpp"
 
@@ -209,6 +210,9 @@ public:
     Dictionary generate_tts_codes_streaming(const Dictionary &params, int64_t request_id, int64_t chunk_frames);
     Array poll_tts_stream();
     void cancel_tts_stream();
+    bool load_tts_waveform_decoder(const Dictionary &config);
+    bool is_tts_waveform_decoder_loaded() const;
+    Dictionary decode_tts_codes_to_waveform(const PackedInt64Array &audio_codes, int64_t frame_count) const;
 
     bool load_asr_token_decoder(const Dictionary &config);
     bool is_asr_token_decoder_loaded() const;
@@ -224,6 +228,7 @@ private:
     std::unique_ptr<gotst::SpeakerEncoderSession> speaker_encoder_;
     std::unique_ptr<gotst::SpeechTokenizerEncoderSession> speech_tokenizer_encoder_;
     std::unique_ptr<gotst::TtsCodeGenerator> tts_code_generator_;
+    std::unique_ptr<gotst::TtsWaveformDecoder> tts_waveform_decoder_;
     std::unique_ptr<gotst::AsrTokenDecoder> asr_token_decoder_;
     std::map<std::string, std::vector<int64_t>> custom_voice_speakers_;
 

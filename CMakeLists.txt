@@ -97,6 +97,7 @@ add_library(gotst-core STATIC
     src/core/speaker_mel.cpp
     src/core/tts_prompt_assembly.cpp
     src/core/tts_code_generator.cpp
+    src/core/tts_waveform_decoder.cpp
     src/core/asr_token_decoder.cpp
     src/core/language_config.cpp
     src/core/fft.cpp

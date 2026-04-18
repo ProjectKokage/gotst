@@ -324,6 +324,18 @@ void GotstSpeechRuntime::_bind_methods() {
         &GotstSpeechRuntime::cancel_tts_stream
     );
     ClassDB::bind_method(
+        D_METHOD("load_tts_waveform_decoder", "config"),
+        &GotstSpeechRuntime::load_tts_waveform_decoder
+    );
+    ClassDB::bind_method(
+        D_METHOD("is_tts_waveform_decoder_loaded"),
+        &GotstSpeechRuntime::is_tts_waveform_decoder_loaded
+    );
+    ClassDB::bind_method(
+        D_METHOD("decode_tts_codes_to_waveform", "audio_codes", "frame_count"),
+        &GotstSpeechRuntime::decode_tts_codes_to_waveform
+    );
+    ClassDB::bind_method(
         D_METHOD("load_asr_token_decoder", "config"),
         &GotstSpeechRuntime::load_asr_token_decoder
     );
@@ -1819,6 +1831,63 @@ Array GotstSpeechRuntime::poll_tts_stream() {
 void GotstSpeechRuntime::cancel_tts_stream() {
     stream_cancel_.cancel();
     stream_active_.store(false, std::memory_order_release);
+}
+
+bool GotstSpeechRuntime::load_tts_waveform_decoder(const Dictionary &config) {
+    gotst::TtsWaveformDecoderConfig decoder_config;
+    decoder_config.decoder_onnx_path = String(config.get("decoder_onnx_path", "")).utf8().get_data();
+    decoder_config.provider = String(config.get("provider", "CPU")).utf8().get_data();
+    decoder_config.intra_op_threads = static_cast<int32_t>(config.get("intra_op_threads", 0));
+    decoder_config.inter_op_threads = static_cast<int32_t>(config.get("inter_op_threads", 0));
+    decoder_config.optimization_level = static_cast<int32_t>(config.get("optimization_level", 99));
+    decoder_config.optimized_model_path = String(config.get("optimized_model_path", "")).utf8().get_data();
+    decoder_config.sample_rate = static_cast<int32_t>(config.get("sample_rate", 24000));
+    decoder_config.normalize_waveform = static_cast<bool>(config.get("normalize_waveform", false));
+    decoder_config.waveform_gain = static_cast<float>(config.get("waveform_gain", 1.0));
+
+    tts_waveform_decoder_ = std::make_unique<gotst::TtsWaveformDecoder>();
+    auto result = tts_waveform_decoder_->load(decoder_config);
+    if(!result.is_ok()) {
+        ERR_PRINT(String("TTS waveform decoder load failed: ") + String(result.error_message().c_str()));
+        tts_waveform_decoder_.reset();
+        return false;
+    }
+    return true;
+}
+
+bool GotstSpeechRuntime::is_tts_waveform_decoder_loaded() const {
+    return tts_waveform_decoder_ && tts_waveform_decoder_->is_loaded();
+}
+
+Dictionary GotstSpeechRuntime::decode_tts_codes_to_waveform(
+    const PackedInt64Array &audio_codes,
+    int64_t frame_count
+) const {
+    Dictionary output;
+    if(!tts_waveform_decoder_ || !tts_waveform_decoder_->is_loaded()) {
+        output["error"] = "TTS waveform decoder is not loaded.";
+        return output;
+    }
+
+    auto result = tts_waveform_decoder_->decode(
+        std::span<const int64_t>(audio_codes.ptr(), static_cast<size_t>(audio_codes.size())),
+        static_cast<int32_t>(frame_count)
+    );
+    if(!result.is_ok()) {
+        output["error"] = String(result.error_message().c_str());
+        return output;
+    }
+
+    const auto &decoded = result.value();
+    output["waveform"] = pack_float_array(decoded.waveform);
+    output["backend"] = String(decoded.backend.c_str());
+    output["elapsed_ms"] = static_cast<int64_t>(std::llround(decoded.elapsed_ms));
+    output["inference_ms"] = static_cast<int64_t>(std::llround(decoded.inference_ms));
+    output["postprocess_ms"] = static_cast<int64_t>(std::llround(decoded.postprocess_ms));
+    output["sample_count"] = decoded.sample_count;
+    output["frame_count"] = decoded.frame_count;
+    output["codes_per_frame"] = decoded.codes_per_frame;
+    return output;
 }
 
 bool GotstSpeechRuntime::load_asr_token_decoder(const Dictionary &config) {
