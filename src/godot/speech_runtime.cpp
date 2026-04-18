@@ -348,6 +348,22 @@ void GotstSpeechRuntime::_bind_methods() {
         &GotstSpeechRuntime::decode_asr_tokens
     );
     ClassDB::bind_method(
+        D_METHOD("load_ten_vad", "config"),
+        &GotstSpeechRuntime::load_ten_vad
+    );
+    ClassDB::bind_method(
+        D_METHOD("is_ten_vad_loaded"),
+        &GotstSpeechRuntime::is_ten_vad_loaded
+    );
+    ClassDB::bind_method(
+        D_METHOD("reset_ten_vad"),
+        &GotstSpeechRuntime::reset_ten_vad
+    );
+    ClassDB::bind_method(
+        D_METHOD("process_ten_vad_samples", "samples", "input_sample_rate"),
+        &GotstSpeechRuntime::process_ten_vad_samples
+    );
+    ClassDB::bind_method(
         D_METHOD("load_speaker_encoder", "model_path"),
         &GotstSpeechRuntime::load_speaker_encoder
     );
@@ -1956,6 +1972,79 @@ Dictionary GotstSpeechRuntime::decode_asr_tokens(const Dictionary &params) {
     }
 
     output["token_ids"] = token_ids;
+    return output;
+}
+
+bool GotstSpeechRuntime::load_ten_vad(const Dictionary &config) {
+    gotst::TenVadConfig ten_vad_config;
+    ten_vad_config.model_path = String(config.get("model_path", "")).utf8().get_data();
+    ten_vad_config.model_sample_rate = static_cast<int32_t>(config.get("model_sample_rate", 16000));
+    ten_vad_config.hop_size = static_cast<int32_t>(config.get("hop_size", 256));
+    ten_vad_config.threshold = static_cast<float>(config.get("threshold", 0.5));
+    ten_vad_config.reset_frame_count = static_cast<int32_t>(config.get("reset_frame_count", 1875));
+    ten_vad_config.pitch_est_voiced_threshold = static_cast<float>(config.get("pitch_est_voiced_threshold", 0.4));
+
+    ten_vad_ = std::make_unique<gotst::TenVad>();
+    auto result = ten_vad_->load(ten_vad_config);
+    if(!result.is_ok()) {
+        ERR_PRINT(String("TEN-Vad load failed: ") + String(result.error_message().c_str()));
+        ten_vad_.reset();
+        return false;
+    }
+    return true;
+}
+
+bool GotstSpeechRuntime::is_ten_vad_loaded() const {
+    return ten_vad_ && ten_vad_->is_loaded();
+}
+
+void GotstSpeechRuntime::reset_ten_vad() {
+    if(!ten_vad_ || !ten_vad_->is_loaded()) {
+        return;
+    }
+    auto result = ten_vad_->reset();
+    if(!result.is_ok()) {
+        ERR_PRINT(String("TEN-Vad reset failed: ") + String(result.error_message().c_str()));
+    }
+}
+
+Dictionary GotstSpeechRuntime::process_ten_vad_samples(
+    const PackedFloat32Array &samples,
+    int64_t input_sample_rate
+) {
+    Dictionary output;
+    if(!ten_vad_ || !ten_vad_->is_loaded()) {
+        output["error"] = "TEN-Vad is not loaded.";
+        return output;
+    }
+
+    auto result = ten_vad_->process(
+        std::span<const float>(samples.ptr(), static_cast<size_t>(samples.size())),
+        static_cast<int32_t>(input_sample_rate)
+    );
+    if(!result.is_ok()) {
+        output["error"] = String(result.error_message().c_str());
+        return output;
+    }
+
+    const auto &processed = result.value();
+    PackedFloat32Array probabilities;
+    probabilities.resize(static_cast<int64_t>(processed.frames.size()));
+    PackedInt32Array flags;
+    flags.resize(static_cast<int64_t>(processed.frames.size()));
+    for(int64_t index = 0; index < static_cast<int64_t>(processed.frames.size()); ++index) {
+        probabilities.set(index, processed.frames[static_cast<size_t>(index)].probability);
+        flags.set(index, processed.frames[static_cast<size_t>(index)].is_voice ? 1 : 0);
+    }
+
+    output["probabilities"] = probabilities;
+    output["flags"] = flags;
+    output["last_probability"] = processed.last_probability;
+    output["last_flag"] = processed.last_is_voice;
+    output["voice_detected"] = processed.any_voice;
+    output["processed_frame_count"] = processed.processed_frame_count;
+    output["hop_size"] = processed.hop_size;
+    output["model_sample_rate"] = processed.model_sample_rate;
     return output;
 }
 

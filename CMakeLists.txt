@@ -4,7 +4,7 @@ project(
     gotst
     VERSION 0.1.0
     DESCRIPTION "Speech-focused Godot GDExtension built on godorama and gonx cores"
-    LANGUAGES CXX
+    LANGUAGES C CXX
 )
 
 set(CMAKE_CXX_STANDARD 20)
@@ -90,6 +90,39 @@ else()
     set(GOTST_GODORAMA_CORE_TARGET godot-llama-core)
 endif()
 
+add_library(gotst-ten-vad STATIC
+    thirdparty/ten_vad/src/aed.cc
+    thirdparty/ten_vad/src/biquad.cc
+    thirdparty/ten_vad/src/fftw.c
+    thirdparty/ten_vad/src/fscvrt.cc
+    thirdparty/ten_vad/src/pitch_est.cc
+    thirdparty/ten_vad/src/stft.cc
+)
+add_library(gotst::ten_vad ALIAS gotst-ten-vad)
+
+target_include_directories(gotst-ten-vad
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/ten_vad/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/ten_vad/include"
+)
+
+target_link_libraries(gotst-ten-vad
+    PUBLIC
+        onnxruntime::onnxruntime
+)
+
+set_target_properties(gotst-ten-vad PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED ON
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    POSITION_INDEPENDENT_CODE ON
+)
+
+if(NOT MSVC)
+    target_compile_options(gotst-ten-vad PRIVATE -Wno-unused-parameter -Wno-sign-compare -Wno-write-strings)
+endif()
+
 add_library(gotst-core STATIC
     src/core/speech_runtime_core.cpp
     src/core/speech_encoder_session.cpp
@@ -99,6 +132,7 @@ add_library(gotst-core STATIC
     src/core/tts_code_generator.cpp
     src/core/tts_waveform_decoder.cpp
     src/core/asr_token_decoder.cpp
+    src/core/ten_vad.cpp
     src/core/language_config.cpp
     src/core/fft.cpp
 )
@@ -115,6 +149,7 @@ target_link_libraries(gotst-core
     PUBLIC
         ${GOTST_GONX_CORE_TARGET}
         ${GOTST_GODORAMA_CORE_TARGET}
+        gotst-ten-vad
 )
 
 set_target_properties(gotst-core PROPERTIES

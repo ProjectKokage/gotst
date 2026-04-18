@@ -18,6 +18,7 @@ add_executable(gotst_unit_tests
     test_speech_tokenizer.cpp
     test_tts_prompt_assembly.cpp
     test_tts_waveform_decoder.cpp
+    test_ten_vad.cpp
     test_custom_voice.cpp
     test_cancellation.cpp
     test_language_config.cpp

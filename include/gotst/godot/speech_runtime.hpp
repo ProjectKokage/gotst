@@ -5,6 +5,7 @@
 #include "gotst/core/tts_code_generator.hpp"
 #include "gotst/core/tts_waveform_decoder.hpp"
 #include "gotst/core/asr_token_decoder.hpp"
+#include "gotst/core/ten_vad.hpp"
 #include "gotst/core/language_config.hpp"
 
 #include <godot_cpp/classes/ref_counted.hpp>
@@ -217,6 +218,10 @@ public:
     bool load_asr_token_decoder(const Dictionary &config);
     bool is_asr_token_decoder_loaded() const;
     Dictionary decode_asr_tokens(const Dictionary &params);
+    bool load_ten_vad(const Dictionary &config);
+    bool is_ten_vad_loaded() const;
+    void reset_ten_vad();
+    Dictionary process_ten_vad_samples(const PackedFloat32Array &samples, int64_t input_sample_rate);
 
 protected:
     static void _bind_methods();
@@ -230,6 +235,7 @@ private:
     std::unique_ptr<gotst::TtsCodeGenerator> tts_code_generator_;
     std::unique_ptr<gotst::TtsWaveformDecoder> tts_waveform_decoder_;
     std::unique_ptr<gotst::AsrTokenDecoder> asr_token_decoder_;
+    std::unique_ptr<gotst::TenVad> ten_vad_;
     std::map<std::string, std::vector<int64_t>> custom_voice_speakers_;
 
     struct StreamEvent {
