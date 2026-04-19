@@ -242,6 +242,17 @@ if(GOTST_BUILD_GDEXTENSION)
                     COMMENT "Copying ${_sym}"
                 )
             endforeach()
+        elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+            get_filename_component(_ort_dir "${_ort_location}" DIRECTORY)
+            file(GLOB _ort_symlinks LIST_DIRECTORIES false "${_ort_dir}/libonnxruntime*.dylib")
+            foreach(_sym ${_ort_symlinks})
+                add_custom_command(TARGET gotst POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_sym}"
+                        "$<TARGET_FILE_DIR:gotst>"
+                    COMMENT "Copying ${_sym}"
+                )
+            endforeach()
         endif()
     endif()
 
@@ -260,7 +271,7 @@ if(GOTST_BUILD_GDEXTENSION)
             install(FILES "${_ort_location}" DESTINATION "addons/gotst/bin")
         else()
             get_filename_component(_ort_dir "${_ort_location}" DIRECTORY)
-            file(GLOB _ort_libs "${_ort_dir}/libonnxruntime*")
+            file(GLOB _ort_libs LIST_DIRECTORIES false "${_ort_dir}/libonnxruntime*")
             install(FILES ${_ort_libs} DESTINATION "addons/gotst/bin")
         endif()
     endif()
