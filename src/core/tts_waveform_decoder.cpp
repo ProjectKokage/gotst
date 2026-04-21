@@ -162,6 +162,9 @@ struct TtsWaveformDecoder::Impl {
     gonx::InferenceSession session;
     TtsWaveformDecoderConfig config;
     bool loaded = false;
+    int64_t input_time_axis = 1;
+    int64_t input_quantizer_axis = 2;
+    int64_t input_quantizer_count = -1;
 };
 
 TtsWaveformDecoder::TtsWaveformDecoder() : impl_(std::make_unique<Impl>()) {}
@@ -195,6 +198,39 @@ Result<void> TtsWaveformDecoder::load(const TtsWaveformDecoderConfig &config) {
         );
     }
 
+    impl_->input_time_axis = 1;
+    impl_->input_quantizer_axis = 2;
+    impl_->input_quantizer_count = -1;
+    const auto &input_specs = impl_->session.input_specs();
+    if(!input_specs.empty()) {
+        const auto &shape = input_specs.front().shape;
+        if(shape.size() >= 3) {
+            const int64_t dim1 = shape[1];
+            const int64_t dim2 = shape[2];
+            const bool dim1_static = dim1 > 0;
+            const bool dim2_static = dim2 > 0;
+            if(dim1_static && !dim2_static) {
+                impl_->input_quantizer_axis = 1;
+                impl_->input_time_axis = 2;
+                impl_->input_quantizer_count = dim1;
+            } else if(!dim1_static && dim2_static) {
+                impl_->input_quantizer_axis = 2;
+                impl_->input_time_axis = 1;
+                impl_->input_quantizer_count = dim2;
+            } else if(dim1_static && dim2_static) {
+                if(dim1 <= dim2) {
+                    impl_->input_quantizer_axis = 1;
+                    impl_->input_time_axis = 2;
+                    impl_->input_quantizer_count = dim1;
+                } else {
+                    impl_->input_quantizer_axis = 2;
+                    impl_->input_time_axis = 1;
+                    impl_->input_quantizer_count = dim2;
+                }
+            }
+        }
+    }
+
     impl_->loaded = true;
     return {};
 }
@@ -225,12 +261,53 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoder::decode(
         return Error::shape_mismatch("TtsWaveformDecoder::decode: resolved codes_per_frame was <= 0.");
     }
 
+    const int32_t target_quantizers = impl_->input_quantizer_count > 0
+        ? static_cast<int32_t>(impl_->input_quantizer_count)
+        : codes_per_frame;
+    if(target_quantizers <= 0) {
+        return Error::shape_mismatch("TtsWaveformDecoder::decode: resolved target quantizer count was <= 0.");
+    }
+
+    const bool requires_relayout =
+        impl_->input_quantizer_axis == 1 || target_quantizers != codes_per_frame;
+    std::vector<int64_t> relaid_codes;
+    std::span<const int64_t> decoder_codes = audio_codes;
+    if(requires_relayout) {
+        relaid_codes.assign(
+            static_cast<size_t>(frame_count) * static_cast<size_t>(target_quantizers),
+            int64_t {0}
+        );
+        const int32_t copy_quantizers = std::min(codes_per_frame, target_quantizers);
+        for(int32_t frame_index = 0; frame_index < frame_count; ++frame_index) {
+            for(int32_t quantizer_index = 0; quantizer_index < copy_quantizers; ++quantizer_index) {
+                const size_t src_index =
+                    static_cast<size_t>(frame_index) * static_cast<size_t>(codes_per_frame) +
+                    static_cast<size_t>(quantizer_index);
+                size_t dst_index = src_index;
+                if(impl_->input_quantizer_axis == 1) {
+                    dst_index =
+                        static_cast<size_t>(quantizer_index) * static_cast<size_t>(frame_count) +
+                        static_cast<size_t>(frame_index);
+                } else {
+                    dst_index =
+                        static_cast<size_t>(frame_index) * static_cast<size_t>(target_quantizers) +
+                        static_cast<size_t>(quantizer_index);
+                }
+                relaid_codes[dst_index] = audio_codes[src_index];
+            }
+        }
+        decoder_codes = relaid_codes;
+    }
+
     auto memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-    std::vector<int64_t> input_shape = {1, frame_count, codes_per_frame};
+    std::vector<int64_t> input_shape =
+        impl_->input_quantizer_axis == 1
+        ? std::vector<int64_t> {1, target_quantizers, frame_count}
+        : std::vector<int64_t> {1, frame_count, target_quantizers};
     Ort::Value input_tensor = Ort::Value::CreateTensor<int64_t>(
         memory_info,
-        const_cast<int64_t *>(audio_codes.data()),
-        audio_codes.size(),
+        const_cast<int64_t *>(decoder_codes.data()),
+        decoder_codes.size(),
         input_shape.data(),
         input_shape.size()
     );

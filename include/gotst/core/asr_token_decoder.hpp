@@ -38,6 +38,10 @@ struct AsrDecodeParams {
 
 struct AsrDecodeResult {
     std::vector<int32_t> token_ids;
+    double elapsed_ms = 0.0;
+    double prefill_ms = 0.0;
+    double decode_ms = 0.0;
+    double onnx_embedding_ms = 0.0;
 };
 
 class AsrTokenDecoder {

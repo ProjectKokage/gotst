@@ -30,6 +30,8 @@ class GotstSpeechRuntime : public RefCounted {
     GDCLASS(GotstSpeechRuntime, RefCounted)
 
 public:
+    ~GotstSpeechRuntime() override;
+
     void set_config(const Ref<GotstSpeechRuntimeConfig> &config);
     Ref<GotstSpeechRuntimeConfig> get_config() const;
 

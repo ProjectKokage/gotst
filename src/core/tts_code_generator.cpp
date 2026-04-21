@@ -532,6 +532,12 @@ Result<TtsGenerateResult> TtsCodeGenerator::run_generation_impl(std::span<const 
 
     const double ms_total = Ms(Clock::now() - t_gen_start).count();
     const double ms_other = ms_total - ms_talker_prefill - ms_talker_decode - ms_predictor_total;
+    result.elapsed_ms = ms_total;
+    result.talker_prefill_ms = ms_talker_prefill;
+    result.talker_decode_ms = ms_talker_decode;
+    result.predictor_ms = ms_predictor_total;
+    result.onnx_embedding_ms = ms_onnx_embedding;
+    result.other_ms = ms_other;
     std::fprintf(
         stderr,
         "%s frames=%d  total=%.0fms  talker_prefill=%.0fms  talker_decode=%.0fms"

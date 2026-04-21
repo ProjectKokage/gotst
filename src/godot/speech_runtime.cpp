@@ -133,6 +133,15 @@ Dictionary pack_tts_prompt_result(const gotst::TtsPromptAssemblyResult &result) 
 
 } // namespace
 
+GotstSpeechRuntime::~GotstSpeechRuntime() {
+    // Keep the GGUF-backed speech decoders alive until process exit. On macOS
+    // headless shutdown, destroying their llama contexts during RefCounted
+    // teardown can raise std::system_error("mutex lock failed") inside the
+    // native runtime after the useful work is already complete.
+    (void)tts_code_generator_.release();
+    (void)asr_token_decoder_.release();
+}
+
 void GotstSpeechRuntime::_bind_methods() {
     ClassDB::bind_method(D_METHOD("set_config", "config"), &GotstSpeechRuntime::set_config);
     ClassDB::bind_method(D_METHOD("get_config"), &GotstSpeechRuntime::get_config);
@@ -1740,6 +1749,12 @@ Dictionary GotstSpeechRuntime::generate_tts_codes(const Dictionary &params) {
     output["codes"] = codes;
     output["frame_count"] = gen.frame_count;
     output["codes_per_frame"] = gen.codes_per_frame;
+    output["elapsed_ms"] = static_cast<int64_t>(std::llround(gen.elapsed_ms));
+    output["talker_prefill_ms"] = static_cast<int64_t>(std::llround(gen.talker_prefill_ms));
+    output["talker_decode_ms"] = static_cast<int64_t>(std::llround(gen.talker_decode_ms));
+    output["predictor_ms"] = static_cast<int64_t>(std::llround(gen.predictor_ms));
+    output["onnx_embedding_ms"] = static_cast<int64_t>(std::llround(gen.onnx_embedding_ms));
+    output["other_ms"] = static_cast<int64_t>(std::llround(gen.other_ms));
     return output;
 }
 
@@ -1972,6 +1987,10 @@ Dictionary GotstSpeechRuntime::decode_asr_tokens(const Dictionary &params) {
     }
 
     output["token_ids"] = token_ids;
+    output["elapsed_ms"] = static_cast<int64_t>(std::llround(decoded.elapsed_ms));
+    output["prefill_ms"] = static_cast<int64_t>(std::llround(decoded.prefill_ms));
+    output["decode_ms"] = static_cast<int64_t>(std::llround(decoded.decode_ms));
+    output["onnx_embedding_ms"] = static_cast<int64_t>(std::llround(decoded.onnx_embedding_ms));
     return output;
 }
 

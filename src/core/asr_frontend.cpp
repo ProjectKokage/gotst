@@ -177,17 +177,28 @@ struct AsrMelPlan {
     std::vector<SparseMelFilter> filter_bank;
 };
 
+struct AsrMelPlanCacheState {
+    std::mutex mutex;
+    std::map<AsrMelPlanKey, std::shared_ptr<const AsrMelPlan>> cache;
+};
+
+AsrMelPlanCacheState &asr_mel_plan_cache_state() {
+    // Keep the frontend cache alive until process exit so shutdown cannot race
+    // static destruction of the mutex or cached mel plans.
+    static auto *state = new AsrMelPlanCacheState();
+    return *state;
+}
+
 std::shared_ptr<const AsrMelPlan> get_asr_mel_plan(int64_t sample_rate,
                                                    int64_t mel_bins,
                                                    int64_t fft_size) {
-    static std::mutex cache_mutex;
-    static std::map<AsrMelPlanKey, std::shared_ptr<const AsrMelPlan>> cache;
+    AsrMelPlanCacheState &cache_state = asr_mel_plan_cache_state();
 
     const AsrMelPlanKey key{sample_rate, mel_bins, fft_size};
     {
-        std::lock_guard<std::mutex> lock(cache_mutex);
-        auto it = cache.find(key);
-        if(it != cache.end()) {
+        std::lock_guard<std::mutex> lock(cache_state.mutex);
+        auto it = cache_state.cache.find(key);
+        if(it != cache_state.cache.end()) {
             return it->second;
         }
     }
@@ -197,8 +208,8 @@ std::shared_ptr<const AsrMelPlan> get_asr_mel_plan(int64_t sample_rate,
     plan->window = build_window(fft_size);
     plan->filter_bank = build_sparse_mel_filter_bank(sample_rate, mel_bins, plan->freq_bins);
 
-    std::lock_guard<std::mutex> lock(cache_mutex);
-    auto [it, inserted] = cache.emplace(key, plan);
+    std::lock_guard<std::mutex> lock(cache_state.mutex);
+    auto [it, inserted] = cache_state.cache.emplace(key, plan);
     if(!inserted) {
         return it->second;
     }

@@ -59,6 +59,12 @@ struct TtsGenerateResult {
     std::vector<int64_t> codes;
     int32_t frame_count = 0;
     int32_t codes_per_frame = 0;
+    double elapsed_ms = 0.0;
+    double talker_prefill_ms = 0.0;
+    double talker_decode_ms = 0.0;
+    double predictor_ms = 0.0;
+    double onnx_embedding_ms = 0.0;
+    double other_ms = 0.0;
 };
 
 struct TtsFrameChunk {

@@ -200,6 +200,10 @@ Result<AsrDecodeResult> AsrTokenDecoder::decode(
     }
 
     double ms_total = Ms(Clock::now() - t_gen_start).count();
+    result.elapsed_ms = ms_total;
+    result.prefill_ms = ms_prefill;
+    result.decode_ms = ms_decode;
+    result.onnx_embedding_ms = ms_onnx;
     int32_t n_tokens = static_cast<int32_t>(result.token_ids.size());
     std::fprintf(stderr,
         "[gotst-asr] tokens=%d  total=%.0fms  prefill=%.0fms  decode=%.0fms  onnx_emb=%.0fms\n",
