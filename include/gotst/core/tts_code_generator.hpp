@@ -26,6 +26,7 @@ struct TtsSessionConfig {
     int32_t predictor_n_batch = 128;
     int32_t n_threads = -1;
     int32_t n_gpu_layers = 0;
+    int32_t predictor_n_gpu_layers = -2;
     bool use_mmap = true;
     bool use_mlock = false;
     int32_t flash_attn_type = -1;

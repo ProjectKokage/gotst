@@ -11,11 +11,14 @@
 #include <godot_cpp/variant/packed_string_array.hpp>
 
 #include <algorithm>
+#include <condition_variable>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <span>
+#include <thread>
 #include <vector>
 
 namespace godot {
@@ -331,6 +334,18 @@ void GotstSpeechRuntime::_bind_methods() {
     ClassDB::bind_method(
         D_METHOD("cancel_tts_stream"),
         &GotstSpeechRuntime::cancel_tts_stream
+    );
+    ClassDB::bind_method(
+        D_METHOD("start_tts_waveform_stream", "params", "request_id", "chunk_frames"),
+        &GotstSpeechRuntime::start_tts_waveform_stream
+    );
+    ClassDB::bind_method(
+        D_METHOD("poll_tts_waveform_stream"),
+        &GotstSpeechRuntime::poll_tts_waveform_stream
+    );
+    ClassDB::bind_method(
+        D_METHOD("cancel_tts_waveform_stream", "request_id"),
+        &GotstSpeechRuntime::cancel_tts_waveform_stream
     );
     ClassDB::bind_method(
         D_METHOD("load_tts_waveform_decoder", "config"),
@@ -1671,6 +1686,9 @@ bool GotstSpeechRuntime::load_tts_code_generator(const Dictionary &config) {
     session_config.predictor_n_batch = static_cast<int32_t>(config.get("predictor_n_batch", 128));
     session_config.n_threads = static_cast<int32_t>(config.get("n_threads", -1));
     session_config.n_gpu_layers = static_cast<int32_t>(config.get("n_gpu_layers", 0));
+    session_config.predictor_n_gpu_layers = static_cast<int32_t>(
+        config.get("predictor_n_gpu_layers", session_config.n_gpu_layers)
+    );
     session_config.use_mmap = static_cast<bool>(config.get("use_mmap", true));
     session_config.use_mlock = static_cast<bool>(config.get("use_mlock", false));
     session_config.flash_attn_type = static_cast<int32_t>(config.get("flash_attn_type", -1));
@@ -1864,6 +1882,242 @@ void GotstSpeechRuntime::cancel_tts_stream() {
     stream_active_.store(false, std::memory_order_release);
 }
 
+Dictionary GotstSpeechRuntime::start_tts_waveform_stream(
+    const Dictionary &params,
+    int64_t request_id,
+    int64_t chunk_frames
+) {
+    Dictionary output;
+    if(!tts_code_generator_ || !tts_code_generator_->is_loaded()) {
+        output["error"] = "TTS code generator is not loaded.";
+        return output;
+    }
+    if(!tts_waveform_decoder_ || !tts_waveform_decoder_->is_loaded()) {
+        output["error"] = "TTS waveform decoder is not loaded.";
+        return output;
+    }
+
+    auto decoder_stream_result = tts_waveform_decoder_->create_stream();
+    if(!decoder_stream_result.is_ok()) {
+        output["error"] = String(decoder_stream_result.error_message().c_str());
+        return output;
+    }
+    std::unique_ptr<gotst::TtsWaveformDecoderStream> decoder_stream =
+        std::move(decoder_stream_result.value());
+
+    {
+        std::lock_guard<std::mutex> lock(waveform_stream_mutex_);
+        while(!waveform_stream_queue_.empty()) {
+            waveform_stream_queue_.pop();
+        }
+    }
+    waveform_stream_cancel_.reset();
+    waveform_stream_active_.store(true, std::memory_order_release);
+
+    const PackedFloat32Array initial_input = params.get("initial_language_input", PackedFloat32Array());
+    const int32_t initial_length = static_cast<int32_t>(params.get("initial_sequence_length", 0));
+    const PackedFloat32Array trailing_hidden = params.get("trailing_text_hidden", PackedFloat32Array());
+    const int32_t trailing_length = static_cast<int32_t>(params.get("trailing_text_length", 0));
+    const PackedFloat32Array pad_embedding = params.get("tts_pad_embedding", PackedFloat32Array());
+
+    gotst::TtsSamplingConfig sampling;
+    sampling.codebook_size = static_cast<int32_t>(params.get("codebook_size", 2048));
+    sampling.residual_groups = static_cast<int32_t>(params.get("residual_groups", 15));
+    sampling.target_frames = static_cast<int32_t>(params.get("target_frames", 96));
+    sampling.min_frames_before_eos = static_cast<int32_t>(params.get("min_frames_before_eos", 8));
+    sampling.hidden_size = static_cast<int32_t>(params.get("hidden_size", 1024));
+    sampling.eos_token_id = static_cast<int32_t>(params.get("eos_token_id", 2150));
+    sampling.eos_logit_margin = static_cast<float>(params.get("eos_logit_margin", 0.0));
+    sampling.do_sample = static_cast<bool>(params.get("do_sample", true));
+    sampling.top_k = static_cast<int32_t>(params.get("top_k", 50));
+    sampling.top_p = static_cast<float>(params.get("top_p", 1.0));
+    sampling.temperature = static_cast<float>(params.get("temperature", 0.9));
+    sampling.sub_do_sample = static_cast<bool>(params.get("sub_do_sample", true));
+    sampling.sub_top_k = static_cast<int32_t>(params.get("sub_top_k", 50));
+    sampling.sub_top_p = static_cast<float>(params.get("sub_top_p", 1.0));
+    sampling.sub_temperature = static_cast<float>(params.get("sub_temperature", 0.9));
+    sampling.repetition_penalty = static_cast<float>(params.get("repetition_penalty", 1.05));
+    sampling.rng_seed = static_cast<int64_t>(params.get("rng_seed", 1));
+
+    using Clock = std::chrono::steady_clock;
+    using Ms = std::chrono::duration<double, std::milli>;
+    const auto stream_start = Clock::now();
+
+    struct DecodeJob {
+        std::vector<int64_t> codes;
+        int32_t frame_count = 0;
+        int32_t codes_per_frame = 0;
+        bool is_final = false;
+        double codegen_ms = 0.0;
+        Clock::time_point queued_at;
+    };
+
+    std::mutex job_mutex;
+    std::condition_variable job_cv;
+    std::deque<DecodeJob> jobs;
+    bool generation_done = false;
+    bool decoder_failed = false;
+
+    auto push_waveform_event = [this](WaveformStreamEvent event) {
+        std::lock_guard<std::mutex> lock(waveform_stream_mutex_);
+        waveform_stream_queue_.push(std::move(event));
+    };
+
+    std::thread decoder_thread([&, request_id]() {
+        while(true) {
+            DecodeJob job;
+            {
+                std::unique_lock<std::mutex> lock(job_mutex);
+                job_cv.wait(lock, [&]() {
+                    return generation_done || !jobs.empty() || waveform_stream_cancel_.is_cancelled();
+                });
+                if((jobs.empty() && generation_done) || waveform_stream_cancel_.is_cancelled()) {
+                    break;
+                }
+                job = std::move(jobs.front());
+                jobs.pop_front();
+            }
+
+            const auto decode_started = Clock::now();
+            const double queue_wait_ms = Ms(decode_started - job.queued_at).count();
+            auto decoded_result = decoder_stream->decode(
+                std::span<const int64_t>(job.codes.data(), job.codes.size()),
+                job.frame_count,
+                job.is_final
+            );
+            const auto event_time = Clock::now();
+            if(!decoded_result.is_ok()) {
+                WaveformStreamEvent event;
+                event.request_id = request_id;
+                event.is_error = true;
+                event.error_message = String(decoded_result.error_message().c_str());
+                event.elapsed_ms = static_cast<int64_t>(std::llround(Ms(event_time - stream_start).count()));
+                event.codegen_ms = static_cast<int64_t>(std::llround(job.codegen_ms));
+                event.queue_wait_ms = static_cast<int64_t>(std::llround(queue_wait_ms));
+                push_waveform_event(std::move(event));
+                waveform_stream_cancel_.cancel();
+                decoder_failed = true;
+                break;
+            }
+
+            const auto &decoded = decoded_result.value();
+            WaveformStreamEvent event;
+            event.request_id = request_id;
+            event.waveform = pack_float_array(decoded.waveform);
+            event.sample_rate = tts_waveform_decoder_sample_rate_;
+            event.frame_count = job.frame_count;
+            event.code_count = static_cast<int32_t>(job.codes.size());
+            event.is_final = job.is_final;
+            event.elapsed_ms = static_cast<int64_t>(std::llround(Ms(event_time - stream_start).count()));
+            event.codegen_ms = static_cast<int64_t>(std::llround(job.codegen_ms));
+            event.decoder_ms = static_cast<int64_t>(std::llround(decoded.elapsed_ms));
+            event.decoder_inference_ms = static_cast<int64_t>(std::llround(decoded.inference_ms));
+            event.decoder_postprocess_ms = static_cast<int64_t>(std::llround(decoded.postprocess_ms));
+            event.queue_wait_ms = static_cast<int64_t>(std::llround(queue_wait_ms));
+            push_waveform_event(std::move(event));
+            if(job.is_final) {
+                break;
+            }
+        }
+    });
+
+    auto on_chunk = [&](gotst::TtsFrameChunk chunk) {
+        if(waveform_stream_cancel_.is_cancelled()) {
+            return;
+        }
+        DecodeJob job;
+        job.codes = std::move(chunk.codes);
+        job.frame_count = chunk.frame_count;
+        job.codes_per_frame = chunk.codes_per_frame;
+        job.is_final = chunk.is_final;
+        job.codegen_ms = Ms(Clock::now() - stream_start).count();
+        job.queued_at = Clock::now();
+        {
+            std::lock_guard<std::mutex> lock(job_mutex);
+            jobs.push_back(std::move(job));
+        }
+        job_cv.notify_one();
+    };
+
+    auto result = tts_code_generator_->generate_streaming(
+        {initial_input.ptr(), static_cast<size_t>(initial_input.size())},
+        initial_length,
+        {trailing_hidden.ptr(), static_cast<size_t>(trailing_hidden.size())},
+        trailing_length,
+        {pad_embedding.ptr(), static_cast<size_t>(pad_embedding.size())},
+        sampling,
+        static_cast<int32_t>(chunk_frames),
+        on_chunk,
+        &waveform_stream_cancel_
+    );
+
+    {
+        std::lock_guard<std::mutex> lock(job_mutex);
+        generation_done = true;
+    }
+    job_cv.notify_one();
+    if(decoder_thread.joinable()) {
+        decoder_thread.join();
+    }
+
+    waveform_stream_active_.store(false, std::memory_order_release);
+
+    if(!result.is_ok() && !decoder_failed) {
+        WaveformStreamEvent err_event;
+        err_event.request_id = request_id;
+        err_event.is_error = true;
+        err_event.error_message = String(result.error_message().c_str());
+        err_event.elapsed_ms = static_cast<int64_t>(std::llround(Ms(Clock::now() - stream_start).count()));
+        push_waveform_event(std::move(err_event));
+
+        output["error"] = String(result.error_message().c_str());
+        return output;
+    }
+
+    if(result.is_ok()) {
+        const auto &gen = result.value();
+        output["frame_count"] = gen.frame_count;
+        output["codes_per_frame"] = gen.codes_per_frame;
+        output["elapsed_ms"] = static_cast<int64_t>(std::llround(gen.elapsed_ms));
+    } else if(decoder_failed) {
+        output["error"] = "TTS waveform decoder failed.";
+    }
+    return output;
+}
+
+Array GotstSpeechRuntime::poll_tts_waveform_stream() {
+    Array events;
+    std::lock_guard<std::mutex> lock(waveform_stream_mutex_);
+    while(!waveform_stream_queue_.empty()) {
+        WaveformStreamEvent &ev = waveform_stream_queue_.front();
+        Dictionary d;
+        d["request_id"] = ev.request_id;
+        d["waveform"] = ev.waveform;
+        d["sample_rate"] = ev.sample_rate;
+        d["frame_count"] = ev.frame_count;
+        d["code_count"] = ev.code_count;
+        d["is_final"] = ev.is_final;
+        d["elapsed_ms"] = ev.elapsed_ms;
+        d["codegen_ms"] = ev.codegen_ms;
+        d["decoder_ms"] = ev.decoder_ms;
+        d["decoder_inference_ms"] = ev.decoder_inference_ms;
+        d["decoder_postprocess_ms"] = ev.decoder_postprocess_ms;
+        d["queue_wait_ms"] = ev.queue_wait_ms;
+        if(ev.is_error) {
+            d["error"] = ev.error_message;
+        }
+        events.push_back(d);
+        waveform_stream_queue_.pop();
+    }
+    return events;
+}
+
+void GotstSpeechRuntime::cancel_tts_waveform_stream(int64_t request_id) {
+    (void)request_id;
+    waveform_stream_cancel_.cancel();
+    waveform_stream_active_.store(false, std::memory_order_release);
+}
+
 bool GotstSpeechRuntime::load_tts_waveform_decoder(const Dictionary &config) {
     gotst::TtsWaveformDecoderConfig decoder_config;
     decoder_config.decoder_onnx_path = String(config.get("decoder_onnx_path", "")).utf8().get_data();
@@ -1875,6 +2129,7 @@ bool GotstSpeechRuntime::load_tts_waveform_decoder(const Dictionary &config) {
     decoder_config.sample_rate = static_cast<int32_t>(config.get("sample_rate", 24000));
     decoder_config.normalize_waveform = static_cast<bool>(config.get("normalize_waveform", false));
     decoder_config.waveform_gain = static_cast<float>(config.get("waveform_gain", 1.0));
+    decoder_config.stateful_chunk_frames = static_cast<int32_t>(config.get("stateful_chunk_frames", 12));
 
     tts_waveform_decoder_ = std::make_unique<gotst::TtsWaveformDecoder>();
     auto result = tts_waveform_decoder_->load(decoder_config);
@@ -1883,6 +2138,7 @@ bool GotstSpeechRuntime::load_tts_waveform_decoder(const Dictionary &config) {
         tts_waveform_decoder_.reset();
         return false;
     }
+    tts_waveform_decoder_sample_rate_ = decoder_config.sample_rate;
     return true;
 }
 

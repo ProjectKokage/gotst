@@ -213,6 +213,9 @@ public:
     Dictionary generate_tts_codes_streaming(const Dictionary &params, int64_t request_id, int64_t chunk_frames);
     Array poll_tts_stream();
     void cancel_tts_stream();
+    Dictionary start_tts_waveform_stream(const Dictionary &params, int64_t request_id, int64_t chunk_frames);
+    Array poll_tts_waveform_stream();
+    void cancel_tts_waveform_stream(int64_t request_id);
     bool load_tts_waveform_decoder(const Dictionary &config);
     bool is_tts_waveform_decoder_loaded() const;
     Dictionary decode_tts_codes_to_waveform(const PackedInt64Array &audio_codes, int64_t frame_count) const;
@@ -236,6 +239,7 @@ private:
     std::unique_ptr<gotst::SpeechTokenizerEncoderSession> speech_tokenizer_encoder_;
     std::unique_ptr<gotst::TtsCodeGenerator> tts_code_generator_;
     std::unique_ptr<gotst::TtsWaveformDecoder> tts_waveform_decoder_;
+    int32_t tts_waveform_decoder_sample_rate_ = 24000;
     std::unique_ptr<gotst::AsrTokenDecoder> asr_token_decoder_;
     std::unique_ptr<gotst::TenVad> ten_vad_;
     std::map<std::string, std::vector<int64_t>> custom_voice_speakers_;
@@ -254,6 +258,28 @@ private:
     std::queue<StreamEvent> stream_queue_;
     std::atomic<bool> stream_active_{false};
     gotst::CancellationToken stream_cancel_;
+
+    struct WaveformStreamEvent {
+        int64_t request_id = 0;
+        PackedFloat32Array waveform;
+        int32_t sample_rate = 0;
+        int32_t frame_count = 0;
+        int32_t code_count = 0;
+        bool is_final = false;
+        bool is_error = false;
+        String error_message;
+        int64_t elapsed_ms = 0;
+        int64_t codegen_ms = 0;
+        int64_t decoder_ms = 0;
+        int64_t decoder_inference_ms = 0;
+        int64_t decoder_postprocess_ms = 0;
+        int64_t queue_wait_ms = 0;
+    };
+
+    std::mutex waveform_stream_mutex_;
+    std::queue<WaveformStreamEvent> waveform_stream_queue_;
+    std::atomic<bool> waveform_stream_active_{false};
+    gotst::CancellationToken waveform_stream_cancel_;
 };
 
 } // namespace godot

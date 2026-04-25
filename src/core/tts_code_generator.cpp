@@ -11,11 +11,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <numeric>
 #include <array>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace gotst {
@@ -33,6 +36,11 @@ void mark_sampled_token(std::vector<uint8_t> &sampled_tokens, int64_t token_inde
     }
 }
 
+bool should_log_tts_timing() {
+    const char *value = std::getenv("GOTST_TTS_TIMING");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
 bool should_stop_eos(const float *logits, int32_t eos_id, int32_t codec_size, float margin) {
     if (eos_id < 0) return false;
     const float eos_logit = logits[eos_id];
@@ -41,6 +49,109 @@ bool should_stop_eos(const float *logits, int32_t eos_id, int32_t codec_size, fl
         best_codec = std::max(best_codec, logits[i]);
     }
     return static_cast<double>(eos_logit) > (static_cast<double>(best_codec) + margin);
+}
+
+struct F32EmbeddingTable {
+    std::vector<float> values;
+    std::string path;
+
+    [[nodiscard]] bool is_valid() const {
+        return !values.empty();
+    }
+
+    [[nodiscard]] const float *row(int64_t row_index, int32_t hidden_size) const {
+        if(row_index < 0 || hidden_size <= 0 || values.empty()) {
+            return nullptr;
+        }
+        const size_t width = static_cast<size_t>(hidden_size);
+        if(values.size() % width != 0) {
+            return nullptr;
+        }
+        const size_t row_count = values.size() / width;
+        const size_t index = static_cast<size_t>(row_index);
+        if(index >= row_count) {
+            return nullptr;
+        }
+        return values.data() + index * width;
+    }
+};
+
+std::string f32_table_path_for_onnx(const std::string &onnx_path) {
+    constexpr const char *suffix = ".onnx";
+    if(onnx_path.size() >= std::strlen(suffix) &&
+       onnx_path.compare(onnx_path.size() - std::strlen(suffix), std::strlen(suffix), suffix) == 0) {
+        return onnx_path.substr(0, onnx_path.size() - std::strlen(suffix)) + ".f32.bin";
+    }
+    return onnx_path + ".f32.bin";
+}
+
+Result<F32EmbeddingTable> load_f32_embedding_table(const std::string &path) {
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    if(!input) {
+        return Error::not_found("Embedding table not found: " + path);
+    }
+
+    const std::streamoff size = input.tellg();
+    if(size <= 0 || size % static_cast<std::streamoff>(sizeof(float)) != 0) {
+        return Error::shape_mismatch("Embedding table has invalid byte size: " + path);
+    }
+    input.seekg(0, std::ios::beg);
+
+    F32EmbeddingTable table;
+    table.path = path;
+    table.values.resize(static_cast<size_t>(size) / sizeof(float));
+    if(!input.read(reinterpret_cast<char *>(table.values.data()), size)) {
+        return Error::io_error("Failed to read embedding table: " + path);
+    }
+    return table;
+}
+
+Error copy_embedding_vector(const F32EmbeddingTable &table,
+                            gonx::InferenceSession &session,
+                            detail::SingleTokenEmbeddingRunScratch &scratch,
+                            int64_t token_id,
+                            const int64_t *generation_step,
+                            int32_t codebook_size,
+                            int32_t hidden_size,
+                            std::vector<float> &destination,
+                            double &ms_onnx_embedding) {
+    if(hidden_size <= 0) {
+        return Error::invalid_argument("Embedding hidden size must be positive.");
+    }
+    if(destination.size() < static_cast<size_t>(hidden_size)) {
+        destination.resize(static_cast<size_t>(hidden_size));
+    }
+
+    if(table.is_valid()) {
+        const int64_t row_index = generation_step != nullptr
+            ? (*generation_step * static_cast<int64_t>(codebook_size)) + token_id
+            : token_id;
+        const float *row = table.row(row_index, hidden_size);
+        if(row == nullptr) {
+            return Error::shape_mismatch("Embedding table row is out of range.");
+        }
+        std::copy_n(row, static_cast<size_t>(hidden_size), destination.begin());
+        return Error::ok();
+    }
+
+    using Clock = std::chrono::steady_clock;
+    using Ms = std::chrono::duration<double, std::milli>;
+    const auto t_onnx = Clock::now();
+    auto run_result = detail::run_single_token_float_embedding(
+        session,
+        scratch,
+        token_id,
+        generation_step
+    );
+    ms_onnx_embedding += Ms(Clock::now() - t_onnx).count();
+    if(!run_result.is_ok()) {
+        return Error::inference_failed(run_result.error_message());
+    }
+    if(run_result.value().values.size() < static_cast<size_t>(hidden_size)) {
+        return Error::shape_mismatch("ONNX embedding returned too few values.");
+    }
+    std::copy_n(run_result.value().values.data(), static_cast<size_t>(hidden_size), destination.begin());
+    return Error::ok();
 }
 
 } // namespace
@@ -52,6 +163,8 @@ struct TtsCodeGenerator::Impl {
     godot_llama::LlamaContextHandle predictor_ctx;
     gonx::InferenceSession codec_embedding;
     gonx::InferenceSession predictor_embedding;
+    F32EmbeddingTable codec_embedding_table;
+    F32EmbeddingTable predictor_embedding_table;
     TtsSessionConfig session_config;
     bool loaded = false;
 };
@@ -98,7 +211,8 @@ Result<void> TtsCodeGenerator::load(const TtsModelPaths &paths, const TtsSession
     predictor_cfg.n_ctx = config.predictor_n_ctx;
     predictor_cfg.n_batch = config.predictor_n_batch;
     predictor_cfg.n_threads = config.n_threads;
-    predictor_cfg.n_gpu_layers = config.n_gpu_layers;
+    predictor_cfg.n_gpu_layers =
+        config.predictor_n_gpu_layers >= -1 ? config.predictor_n_gpu_layers : config.n_gpu_layers;
     predictor_cfg.use_mmap = config.use_mmap;
     predictor_cfg.use_mlock = config.use_mlock;
     predictor_cfg.flash_attn_type = config.flash_attn_type;
@@ -115,18 +229,43 @@ Result<void> TtsCodeGenerator::load(const TtsModelPaths &paths, const TtsSession
         return Error::model_not_loaded("Failed to create predictor context: " + pred_ctx_err.message);
     }
 
-    // Load ONNX sessions.
+    // Load embedding tables when available; fall back to ONNX sessions for
+    // portability when converter-side raw tables have not been generated.
     gonx::SessionConfig onnx_cfg;
     onnx_cfg.optimization_level = 99;
 
-    auto codec_status = impl_->codec_embedding.load(paths.codec_embedding_onnx_path, onnx_cfg);
-    if (codec_status.has_error()) {
-        return Error::model_not_loaded("Failed to load codec embedding ONNX: " + codec_status.error().message);
+    impl_->codec_embedding_table = {};
+    auto codec_table = load_f32_embedding_table(f32_table_path_for_onnx(paths.codec_embedding_onnx_path));
+    if(codec_table.is_ok()) {
+        impl_->codec_embedding_table = std::move(codec_table.value());
+        std::fprintf(stderr, "[gotst-tts] loaded codec embedding table: %s\n",
+                     impl_->codec_embedding_table.path.c_str());
+    } else {
+        if(codec_table.error_code() != ErrorCode::NotFound) {
+            std::fprintf(stderr, "[gotst-tts] codec embedding table unavailable: %s\n",
+                         codec_table.error_message().c_str());
+        }
+        auto codec_status = impl_->codec_embedding.load(paths.codec_embedding_onnx_path, onnx_cfg);
+        if (codec_status.has_error()) {
+            return Error::model_not_loaded("Failed to load codec embedding ONNX: " + codec_status.error().message);
+        }
     }
 
-    auto pred_emb_status = impl_->predictor_embedding.load(paths.predictor_embedding_onnx_path, onnx_cfg);
-    if (pred_emb_status.has_error()) {
-        return Error::model_not_loaded("Failed to load predictor embedding ONNX: " + pred_emb_status.error().message);
+    impl_->predictor_embedding_table = {};
+    auto predictor_table = load_f32_embedding_table(f32_table_path_for_onnx(paths.predictor_embedding_onnx_path));
+    if(predictor_table.is_ok()) {
+        impl_->predictor_embedding_table = std::move(predictor_table.value());
+        std::fprintf(stderr, "[gotst-tts] loaded predictor embedding table: %s\n",
+                     impl_->predictor_embedding_table.path.c_str());
+    } else {
+        if(predictor_table.error_code() != ErrorCode::NotFound) {
+            std::fprintf(stderr, "[gotst-tts] predictor embedding table unavailable: %s\n",
+                         predictor_table.error_message().c_str());
+        }
+        auto pred_emb_status = impl_->predictor_embedding.load(paths.predictor_embedding_onnx_path, onnx_cfg);
+        if (pred_emb_status.has_error()) {
+            return Error::model_not_loaded("Failed to load predictor embedding ONNX: " + pred_emb_status.error().message);
+        }
     }
 
     impl_->loaded = true;
@@ -167,6 +306,10 @@ Result<TtsGenerateResult> TtsCodeGenerator::run_generation_impl(std::span<const 
     double ms_talker_prefill = 0.0;
     double ms_talker_decode = 0.0;
     double ms_predictor_total = 0.0;
+    double ms_predictor_clear = 0.0;
+    double ms_predictor_prefill = 0.0;
+    double ms_predictor_sample = 0.0;
+    double ms_predictor_incremental = 0.0;
     double ms_onnx_embedding = 0.0;
 
     int32_t language_length = initial_sequence_length;
@@ -179,10 +322,6 @@ Result<TtsGenerateResult> TtsCodeGenerator::run_generation_impl(std::span<const 
     );
 
     std::vector<uint8_t> sampled_primary_codes(static_cast<size_t>(codebook_size), 0);
-    std::vector<uint8_t> sampled_all_codes(
-        static_cast<size_t>(codebook_size) * static_cast<size_t>(std::max(residual_groups, 1)),
-        0
-    );
     detail::SamplingScratch sampling_scratch;
     detail::SingleTokenEmbeddingRunScratch onnx_scratch;
 
@@ -198,6 +337,8 @@ Result<TtsGenerateResult> TtsCodeGenerator::run_generation_impl(std::span<const 
     if(residual_groups > 0) {
         predictor_input.resize(static_cast<size_t>(2 * hidden_size));
     }
+    std::vector<float> primary_embedding_buffer(static_cast<size_t>(hidden_size));
+    std::vector<float> residual_embedding_buffer(static_cast<size_t>(hidden_size));
     std::vector<float> summed_embedding(static_cast<size_t>(hidden_size));
     std::vector<float> next_embedding(static_cast<size_t>(hidden_size));
 
@@ -294,38 +435,39 @@ Result<TtsGenerateResult> TtsCodeGenerator::run_generation_impl(std::span<const 
         }
         rng_state = primary.rng_state;
         mark_sampled_token(sampled_primary_codes, primary.token);
-        mark_sampled_token(sampled_all_codes, primary.token);
         result.codes.push_back(primary.token);
         if(streaming) {
             chunk_codes.push_back(primary.token);
         }
 
-        auto t_onnx = Clock::now();
-        auto primary_embedding_run = detail::run_single_token_float_embedding(
+        auto primary_embedding_err = copy_embedding_vector(
+            impl_->codec_embedding_table,
             impl_->codec_embedding,
             onnx_scratch,
-            primary.token
+            primary.token,
+            nullptr,
+            codebook_size,
+            hidden_size,
+            primary_embedding_buffer,
+            ms_onnx_embedding
         );
-        ms_onnx_embedding += Ms(Clock::now() - t_onnx).count();
-        if(!primary_embedding_run.is_ok()) {
+        if(!primary_embedding_err.is_ok()) {
             return Error::inference_failed(
-                "Codec embedding at frame " + std::to_string(frame) + ": " + primary_embedding_run.error_message()
+                "Codec embedding at frame " + std::to_string(frame) + ": " + primary_embedding_err.message
             );
         }
-        if(primary_embedding_run.value().values.size() < static_cast<size_t>(hidden_size)) {
-            return Error::inference_failed("Codec embedding too small at frame " + std::to_string(frame));
-        }
-
-        const std::span<const float> primary_embedding =
-            primary_embedding_run.value().values.first(static_cast<size_t>(hidden_size));
-        std::copy_n(primary_embedding.data(), static_cast<size_t>(hidden_size), summed_embedding.begin());
+        std::copy_n(primary_embedding_buffer.data(), static_cast<size_t>(hidden_size), summed_embedding.begin());
 
         auto t_pred_start = Clock::now();
         if(residual_groups > 0) {
             std::memcpy(predictor_input.data(), talker_hidden, hidden_bytes);
-            std::memcpy(predictor_input.data() + hidden_size, primary_embedding.data(), hidden_bytes);
+            std::memcpy(predictor_input.data() + hidden_size, primary_embedding_buffer.data(), hidden_bytes);
 
+            auto t_pred_clear = Clock::now();
             impl_->predictor_ctx.clear_kv_cache();
+            ms_predictor_clear += Ms(Clock::now() - t_pred_clear).count();
+
+            auto t_pred_prefill = Clock::now();
             auto predictor_err = impl_->predictor_ctx.decode_embeddings(
                 predictor_input,
                 2,
@@ -333,6 +475,7 @@ Result<TtsGenerateResult> TtsCodeGenerator::run_generation_impl(std::span<const 
                 predictor_prefill_positions,
                 predictor_pos_components
             );
+            ms_predictor_prefill += Ms(Clock::now() - t_pred_prefill).count();
             if(!predictor_err.ok()) {
                 return Error::inference_failed("Predictor prefill failed at frame " + std::to_string(frame));
             }
@@ -351,6 +494,7 @@ Result<TtsGenerateResult> TtsCodeGenerator::run_generation_impl(std::span<const 
                 }
 
                 const int32_t logit_offset = group * codebook_size;
+                auto t_sample = Clock::now();
                 auto residual = detail::sample_token(
                     pred_logits,
                     logit_offset,
@@ -359,13 +503,14 @@ Result<TtsGenerateResult> TtsCodeGenerator::run_generation_impl(std::span<const 
                     params.sub_top_k,
                     params.sub_top_p,
                     params.sub_temperature,
-                    [&sampled_all_codes](int64_t token_index) {
-                        return has_sampled_token(sampled_all_codes, token_index);
+                    [](int64_t) {
+                        return false;
                     },
-                    params.repetition_penalty,
+                    1.0f,
                     rng_state,
                     sampling_scratch
                 );
+                ms_predictor_sample += Ms(Clock::now() - t_sample).count();
                 rng_state = residual.rng_state;
 
                 int64_t residual_code = residual.token >= logit_offset ? residual.token - logit_offset : residual.token;
@@ -373,36 +518,33 @@ Result<TtsGenerateResult> TtsCodeGenerator::run_generation_impl(std::span<const 
                     residual_code = primary.token;
                 }
 
-                mark_sampled_token(sampled_all_codes, residual.token);
                 result.codes.push_back(residual_code);
                 if(streaming) {
                     chunk_codes.push_back(residual_code);
                 }
 
                 const int64_t generation_step = static_cast<int64_t>(group);
-                auto t_emb = Clock::now();
-                auto residual_embedding_run = detail::run_single_token_float_embedding(
+                auto residual_embedding_err = copy_embedding_vector(
+                    impl_->predictor_embedding_table,
                     impl_->predictor_embedding,
                     onnx_scratch,
                     residual_code,
-                    &generation_step
+                    &generation_step,
+                    codebook_size,
+                    hidden_size,
+                    residual_embedding_buffer,
+                    ms_onnx_embedding
                 );
-                ms_onnx_embedding += Ms(Clock::now() - t_emb).count();
-                if(group + 1 < residual_groups) {
-                    if(!residual_embedding_run.is_ok()) {
-                        return Error::inference_failed(
-                            "Predictor embedding at group " + std::to_string(group) + ": " +
-                            residual_embedding_run.error_message()
-                        );
-                    }
-                    if(residual_embedding_run.value().values.size() < static_cast<size_t>(hidden_size)) {
-                        return Error::inference_failed("Predictor embedding too small at group " + std::to_string(group));
-                    }
+                if(!residual_embedding_err.is_ok()) {
+                    return Error::inference_failed(
+                        "Predictor embedding at group " + std::to_string(group) + ": " +
+                        residual_embedding_err.message
+                    );
+                }
 
-                    const std::span<const float> residual_embedding =
-                        residual_embedding_run.value().values.first(static_cast<size_t>(hidden_size));
+                if(group + 1 < residual_groups) {
                     for(int32_t index = 0; index < hidden_size; ++index) {
-                        summed_embedding[static_cast<size_t>(index)] += residual_embedding[static_cast<size_t>(index)];
+                        summed_embedding[static_cast<size_t>(index)] += residual_embedding_buffer[static_cast<size_t>(index)];
                     }
 
                     next_position_base[0] = pred_length;
@@ -419,27 +561,24 @@ Result<TtsGenerateResult> TtsCodeGenerator::run_generation_impl(std::span<const 
                         );
                     }
 
+                    auto t_incr = Clock::now();
                     auto incr_err = impl_->predictor_ctx.decode_embeddings(
-                        residual_embedding,
+                        residual_embedding_buffer,
                         1,
                         hidden_size,
                         next_predictor_positions,
                         predictor_pos_components
                     );
+                    ms_predictor_incremental += Ms(Clock::now() - t_incr).count();
                     if(!incr_err.ok()) {
                         return Error::inference_failed(
                             "Predictor incremental decode failed at group " + std::to_string(group)
                         );
                     }
                     pred_length++;
-                } else if(
-                    residual_embedding_run.is_ok() &&
-                    residual_embedding_run.value().values.size() >= static_cast<size_t>(hidden_size)
-                ) {
-                    const std::span<const float> residual_embedding =
-                        residual_embedding_run.value().values.first(static_cast<size_t>(hidden_size));
+                } else {
                     for(int32_t index = 0; index < hidden_size; ++index) {
-                        summed_embedding[static_cast<size_t>(index)] += residual_embedding[static_cast<size_t>(index)];
+                        summed_embedding[static_cast<size_t>(index)] += residual_embedding_buffer[static_cast<size_t>(index)];
                     }
                 }
             }
@@ -538,19 +677,26 @@ Result<TtsGenerateResult> TtsCodeGenerator::run_generation_impl(std::span<const 
     result.predictor_ms = ms_predictor_total;
     result.onnx_embedding_ms = ms_onnx_embedding;
     result.other_ms = ms_other;
-    std::fprintf(
-        stderr,
-        "%s frames=%d  total=%.0fms  talker_prefill=%.0fms  talker_decode=%.0fms"
-        "  predictor=%.0fms  onnx_emb=%.0fms  other=%.0fms\n",
-        log_tag,
-        produced_frames,
-        ms_total,
-        ms_talker_prefill,
-        ms_talker_decode,
-        ms_predictor_total,
-        ms_onnx_embedding,
-        ms_other
-    );
+    if(should_log_tts_timing()) {
+        std::fprintf(
+            stderr,
+            "%s frames=%d  total=%.0fms  talker_prefill=%.0fms  talker_decode=%.0fms"
+            "  predictor=%.0fms  pred_clear=%.0fms  pred_prefill=%.0fms"
+            "  pred_incr=%.0fms  pred_sample=%.0fms  onnx_emb=%.0fms  other=%.0fms\n",
+            log_tag,
+            produced_frames,
+            ms_total,
+            ms_talker_prefill,
+            ms_talker_decode,
+            ms_predictor_total,
+            ms_predictor_clear,
+            ms_predictor_prefill,
+            ms_predictor_incremental,
+            ms_predictor_sample,
+            ms_onnx_embedding,
+            ms_other
+        );
+    }
 
     return result;
 }

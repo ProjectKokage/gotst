@@ -20,6 +20,7 @@ struct TtsWaveformDecoderConfig {
     int32_t sample_rate = 24000;
     bool normalize_waveform = false;
     float waveform_gain = 1.0f;
+    int32_t stateful_chunk_frames = 12;
 };
 
 struct TtsWaveformDecodeResult {
@@ -32,6 +33,8 @@ struct TtsWaveformDecodeResult {
     double postprocess_ms = 0.0;
     std::string backend = "gotst_native";
 };
+
+class TtsWaveformDecoderStream;
 
 class TtsWaveformDecoder {
 public:
@@ -51,7 +54,37 @@ public:
         int32_t frame_count
     ) const;
 
+    Result<std::unique_ptr<TtsWaveformDecoderStream>> create_stream() const;
+
 private:
+    friend class TtsWaveformDecoderStream;
+
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+class TtsWaveformDecoderStream {
+public:
+    ~TtsWaveformDecoderStream();
+
+    TtsWaveformDecoderStream(const TtsWaveformDecoderStream &) = delete;
+    TtsWaveformDecoderStream &operator=(const TtsWaveformDecoderStream &) = delete;
+    TtsWaveformDecoderStream(TtsWaveformDecoderStream &&) noexcept;
+    TtsWaveformDecoderStream &operator=(TtsWaveformDecoderStream &&) noexcept;
+
+    void reset();
+
+    Result<TtsWaveformDecodeResult> decode(
+        std::span<const int64_t> audio_codes,
+        int32_t frame_count,
+        bool is_final
+    );
+
+private:
+    friend class TtsWaveformDecoder;
+
+    explicit TtsWaveformDecoderStream(const TtsWaveformDecoder &decoder);
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
