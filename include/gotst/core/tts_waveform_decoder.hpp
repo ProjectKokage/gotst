@@ -12,6 +12,7 @@ namespace gotst {
 
 struct TtsWaveformDecoderConfig {
     std::string decoder_onnx_path;
+    std::string provider_requested;
     std::string provider = "CPU";
     int32_t intra_op_threads = 0;
     int32_t inter_op_threads = 0;
@@ -32,6 +33,10 @@ struct TtsWaveformDecodeResult {
     double inference_ms = 0.0;
     double postprocess_ms = 0.0;
     std::string backend = "gotst_native";
+    std::string provider_requested = "CPU";
+    std::string provider_effective = "CPU";
+    int32_t cpu_fallback_node_count = -1;
+    bool fixed_shape = false;
 };
 
 class TtsWaveformDecoderStream;

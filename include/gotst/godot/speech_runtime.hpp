@@ -266,6 +266,10 @@ private:
         int64_t queue_wait_ms = 0;
         int64_t pipeline_queue_wait_ms = 0;
         int64_t native_pack_ms = 0;
+        String decoder_provider_requested;
+        String decoder_provider_effective;
+        int64_t decoder_cpu_fallback_node_count = -1;
+        bool decoder_fixed_shape = false;
         int64_t talker_prefill_ms = 0;
         int64_t talker_decode_ms = 0;
         int64_t predictor_ms = 0;

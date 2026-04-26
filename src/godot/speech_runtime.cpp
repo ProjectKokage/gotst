@@ -2100,6 +2100,10 @@ void GotstSpeechRuntime::waveform_decoder_worker_main() {
         event.queue_wait_ms = round_ms(queue_wait_ms);
         event.pipeline_queue_wait_ms = round_ms(job.pipeline_queue_wait_ms);
         event.native_pack_ms = round_ms(pack_ms);
+        event.decoder_provider_requested = String(decoded.provider_requested.c_str());
+        event.decoder_provider_effective = String(decoded.provider_effective.c_str());
+        event.decoder_cpu_fallback_node_count = decoded.cpu_fallback_node_count;
+        event.decoder_fixed_shape = decoded.fixed_shape;
         push_waveform_event(std::move(event));
     }
 }
@@ -2127,6 +2131,10 @@ Array GotstSpeechRuntime::poll_tts_waveform_stream() {
         d["queue_wait_ms"] = ev.queue_wait_ms;
         d["pipeline_queue_wait_ms"] = ev.pipeline_queue_wait_ms;
         d["native_pack_ms"] = ev.native_pack_ms;
+        d["decoder_provider_requested"] = ev.decoder_provider_requested;
+        d["decoder_provider_effective"] = ev.decoder_provider_effective;
+        d["decoder_cpu_fallback_node_count"] = ev.decoder_cpu_fallback_node_count;
+        d["decoder_fixed_shape"] = ev.decoder_fixed_shape;
         d["talker_prefill_ms"] = ev.talker_prefill_ms;
         d["talker_decode_ms"] = ev.talker_decode_ms;
         d["predictor_ms"] = ev.predictor_ms;
@@ -2182,6 +2190,7 @@ bool GotstSpeechRuntime::load_tts_waveform_decoder(const Dictionary &config) {
 
     gotst::TtsWaveformDecoderConfig decoder_config;
     decoder_config.decoder_onnx_path = String(config.get("decoder_onnx_path", "")).utf8().get_data();
+    decoder_config.provider_requested = String(config.get("provider_requested", "")).utf8().get_data();
     decoder_config.provider = String(config.get("provider", "CPU")).utf8().get_data();
     decoder_config.intra_op_threads = static_cast<int32_t>(config.get("intra_op_threads", 0));
     decoder_config.inter_op_threads = static_cast<int32_t>(config.get("inter_op_threads", 0));
@@ -2229,6 +2238,10 @@ Dictionary GotstSpeechRuntime::decode_tts_codes_to_waveform(
     const auto &decoded = result.value();
     output["waveform"] = pack_float_array(decoded.waveform);
     output["backend"] = String(decoded.backend.c_str());
+    output["provider_requested"] = String(decoded.provider_requested.c_str());
+    output["provider_effective"] = String(decoded.provider_effective.c_str());
+    output["cpu_fallback_node_count"] = decoded.cpu_fallback_node_count;
+    output["fixed_shape"] = decoded.fixed_shape;
     output["elapsed_ms"] = static_cast<int64_t>(std::llround(decoded.elapsed_ms));
     output["inference_ms"] = static_cast<int64_t>(std::llround(decoded.inference_ms));
     output["postprocess_ms"] = static_cast<int64_t>(std::llround(decoded.postprocess_ms));

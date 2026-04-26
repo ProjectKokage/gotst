@@ -194,9 +194,12 @@ struct StatefulDecodeScratch {
     std::vector<int64_t> chunk_codes;
     std::vector<int64_t> chunk_shape = {1, 0, 0};
     std::vector<int64_t> is_last_shape = {1};
+    std::vector<int64_t> raw_shape = {0};
     std::vector<Ort::Value> inputs;
     std::vector<float> raw_waveform;
     std::unique_ptr<Ort::MemoryInfo> memory_info;
+    float zero_float = 0.0f;
+    float is_last_value = 0.0f;
 };
 
 int32_t parse_stateful_index(const std::string &name, std::string_view prefix) {
@@ -260,6 +263,7 @@ struct TtsWaveformDecoder::Impl {
     int64_t input_time_axis = 1;
     int64_t input_quantizer_axis = 2;
     int64_t input_quantizer_count = -1;
+    bool fixed_shape_decoder = false;
     std::vector<StatefulInputBinding> stateful_input_bindings;
     int32_t stateful_final_wav_output = -1;
     int32_t stateful_valid_samples_output = -1;
@@ -304,6 +308,7 @@ Result<void> TtsWaveformDecoder::load(const TtsWaveformDecoderConfig &config) {
     impl_->input_time_axis = 1;
     impl_->input_quantizer_axis = 2;
     impl_->input_quantizer_count = -1;
+    impl_->fixed_shape_decoder = false;
     const auto &input_specs = impl_->session.input_specs();
     if(!input_specs.empty()) {
         const auto &shape = input_specs.front().shape;
@@ -330,6 +335,11 @@ Result<void> TtsWaveformDecoder::load(const TtsWaveformDecoderConfig &config) {
                     impl_->input_time_axis = 1;
                     impl_->input_quantizer_count = dim2;
                 }
+            }
+            if(impl_->input_time_axis >= 0 &&
+               impl_->input_time_axis < static_cast<int64_t>(shape.size())) {
+                impl_->fixed_shape_decoder =
+                    shape[static_cast<size_t>(impl_->input_time_axis)] > 0;
             }
         }
     }
@@ -515,8 +525,6 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoder::decode(
         );
         scratch.raw_waveform.reserve(static_cast<size_t>(frame_count) * 1600);
         double inference_ms = 0.0;
-        float zero_float = 0.0f;
-
         for(int32_t frame_offset = 0; frame_offset < frame_count; frame_offset += chunk_frames_limit) {
             const int32_t chunk_frames = std::min(chunk_frames_limit, frame_count - frame_offset);
             const bool chunk_is_final = (frame_offset + chunk_frames) >= frame_count;
@@ -551,7 +559,7 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoder::decode(
                 scratch.chunk_shape[1] = chunk_frames;
                 scratch.chunk_shape[2] = target_quantizers;
             }
-            float is_last_value = chunk_is_final ? 1.0f : 0.0f;
+            scratch.is_last_value = chunk_is_final ? 1.0f : 0.0f;
 
             scratch.inputs.clear();
             for(const StatefulInputBinding &binding : impl_->stateful_input_bindings) {
@@ -567,7 +575,7 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoder::decode(
                     break;
                 case StatefulInputKind::PreConvHistory: {
                     float *data = state.pre_conv_history.data.empty()
-                        ? &zero_float
+                        ? &scratch.zero_float
                         : state.pre_conv_history.data.data();
                     scratch.inputs.push_back(Ort::Value::CreateTensor<float>(
                         memory_info,
@@ -580,7 +588,7 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoder::decode(
                 }
                 case StatefulInputKind::LatentBuffer: {
                     float *data = state.latent_buffer.data.empty()
-                        ? &zero_float
+                        ? &scratch.zero_float
                         : state.latent_buffer.data.data();
                     scratch.inputs.push_back(Ort::Value::CreateTensor<float>(
                         memory_info,
@@ -593,7 +601,7 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoder::decode(
                 }
                 case StatefulInputKind::ConvHistory: {
                     float *data = state.conv_history.data.empty()
-                        ? &zero_float
+                        ? &scratch.zero_float
                         : state.conv_history.data.data();
                     scratch.inputs.push_back(Ort::Value::CreateTensor<float>(
                         memory_info,
@@ -607,7 +615,7 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoder::decode(
                 case StatefulInputKind::IsLast:
                     scratch.inputs.push_back(Ort::Value::CreateTensor<float>(
                         memory_info,
-                        &is_last_value,
+                        &scratch.is_last_value,
                         1,
                         scratch.is_last_shape.data(),
                         scratch.is_last_shape.size()
@@ -619,7 +627,7 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoder::decode(
                         return Error::shape_mismatch("TtsWaveformDecoder::decode: invalid stateful key input " + binding.name);
                     }
                     StatefulTensor &tensor = state.keys[static_cast<size_t>(layer_index)];
-                    float *data = tensor.data.empty() ? &zero_float : tensor.data.data();
+                    float *data = tensor.data.empty() ? &scratch.zero_float : tensor.data.data();
                     scratch.inputs.push_back(Ort::Value::CreateTensor<float>(
                         memory_info,
                         data,
@@ -635,7 +643,7 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoder::decode(
                         return Error::shape_mismatch("TtsWaveformDecoder::decode: invalid stateful value input " + binding.name);
                     }
                     StatefulTensor &tensor = state.values[static_cast<size_t>(layer_index)];
-                    float *data = tensor.data.empty() ? &zero_float : tensor.data.data();
+                    float *data = tensor.data.empty() ? &scratch.zero_float : tensor.data.data();
                     scratch.inputs.push_back(Ort::Value::CreateTensor<float>(
                         memory_info,
                         data,
@@ -764,10 +772,10 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoder::decode(
         }
 
         const auto postprocess_start = Clock::now();
-        std::vector<int64_t> raw_shape = {static_cast<int64_t>(scratch.raw_waveform.size())};
+        scratch.raw_shape[0] = static_cast<int64_t>(scratch.raw_waveform.size());
         std::vector<float> waveform = convert_decoder_output_to_waveform(
             std::span<const float>(scratch.raw_waveform.data(), scratch.raw_waveform.size()),
-            std::span<const int64_t>(raw_shape.data(), raw_shape.size()),
+            std::span<const int64_t>(scratch.raw_shape.data(), scratch.raw_shape.size()),
             impl_->config.sample_rate,
             impl_->config.normalize_waveform,
             impl_->config.waveform_gain
@@ -787,6 +795,12 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoder::decode(
         result.inference_ms = inference_ms;
         result.postprocess_ms = postprocess_ms;
         result.backend = "gotst_native_stateful";
+        result.provider_requested = impl_->config.provider_requested.empty()
+            ? impl_->config.provider
+            : impl_->config.provider_requested;
+        result.provider_effective = impl_->config.provider;
+        result.cpu_fallback_node_count = -1;
+        result.fixed_shape = impl_->fixed_shape_decoder;
         return result;
     }
 
@@ -861,6 +875,12 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoder::decode(
     result.elapsed_ms = elapsed_ms;
     result.inference_ms = inference_ms;
     result.postprocess_ms = postprocess_ms;
+    result.provider_requested = impl_->config.provider_requested.empty()
+        ? impl_->config.provider
+        : impl_->config.provider_requested;
+    result.provider_effective = impl_->config.provider;
+    result.cpu_fallback_node_count = -1;
+    result.fixed_shape = impl_->fixed_shape_decoder;
     return result;
 }
 
@@ -971,7 +991,6 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoderStream::decode(
     scratch.raw_waveform.reserve(static_cast<size_t>(frame_count) * 1600);
 
     double inference_ms = 0.0;
-    float zero_float = 0.0f;
     const bool can_use_direct_codes =
         decoder_impl.input_quantizer_axis != 1 && target_quantizers == codes_per_frame;
     for(int32_t frame_offset = 0; frame_offset < frame_count; frame_offset += chunk_frames_limit) {
@@ -1017,7 +1036,7 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoderStream::decode(
             scratch.chunk_shape[1] = chunk_frames;
             scratch.chunk_shape[2] = target_quantizers;
         }
-        float is_last_value = chunk_is_final ? 1.0f : 0.0f;
+        scratch.is_last_value = chunk_is_final ? 1.0f : 0.0f;
 
         scratch.inputs.clear();
         for(const StatefulInputBinding &binding : decoder_impl.stateful_input_bindings) {
@@ -1033,7 +1052,7 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoderStream::decode(
                 break;
             case StatefulInputKind::PreConvHistory: {
                 float *data = state.pre_conv_history.data.empty()
-                    ? &zero_float
+                    ? &scratch.zero_float
                     : state.pre_conv_history.data.data();
                 scratch.inputs.push_back(Ort::Value::CreateTensor<float>(
                     memory_info,
@@ -1046,7 +1065,7 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoderStream::decode(
             }
             case StatefulInputKind::LatentBuffer: {
                 float *data = state.latent_buffer.data.empty()
-                    ? &zero_float
+                    ? &scratch.zero_float
                     : state.latent_buffer.data.data();
                 scratch.inputs.push_back(Ort::Value::CreateTensor<float>(
                     memory_info,
@@ -1059,7 +1078,7 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoderStream::decode(
             }
             case StatefulInputKind::ConvHistory: {
                 float *data = state.conv_history.data.empty()
-                    ? &zero_float
+                    ? &scratch.zero_float
                     : state.conv_history.data.data();
                 scratch.inputs.push_back(Ort::Value::CreateTensor<float>(
                     memory_info,
@@ -1073,7 +1092,7 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoderStream::decode(
             case StatefulInputKind::IsLast:
                 scratch.inputs.push_back(Ort::Value::CreateTensor<float>(
                     memory_info,
-                    &is_last_value,
+                    &scratch.is_last_value,
                     1,
                     scratch.is_last_shape.data(),
                     scratch.is_last_shape.size()
@@ -1085,7 +1104,7 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoderStream::decode(
                     return Error::shape_mismatch("TtsWaveformDecoderStream::decode: invalid stateful key input " + binding.name);
                 }
                 StatefulTensor &tensor = state.keys[static_cast<size_t>(layer_index)];
-                float *data = tensor.data.empty() ? &zero_float : tensor.data.data();
+                float *data = tensor.data.empty() ? &scratch.zero_float : tensor.data.data();
                 scratch.inputs.push_back(Ort::Value::CreateTensor<float>(
                     memory_info,
                     data,
@@ -1101,7 +1120,7 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoderStream::decode(
                     return Error::shape_mismatch("TtsWaveformDecoderStream::decode: invalid stateful value input " + binding.name);
                 }
                 StatefulTensor &tensor = state.values[static_cast<size_t>(layer_index)];
-                float *data = tensor.data.empty() ? &zero_float : tensor.data.data();
+                float *data = tensor.data.empty() ? &scratch.zero_float : tensor.data.data();
                 scratch.inputs.push_back(Ort::Value::CreateTensor<float>(
                     memory_info,
                     data,
@@ -1230,10 +1249,10 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoderStream::decode(
     }
 
     const auto postprocess_start = Clock::now();
-    std::vector<int64_t> raw_shape = {static_cast<int64_t>(scratch.raw_waveform.size())};
+    scratch.raw_shape[0] = static_cast<int64_t>(scratch.raw_waveform.size());
     std::vector<float> waveform = convert_decoder_output_to_waveform(
         std::span<const float>(scratch.raw_waveform.data(), scratch.raw_waveform.size()),
-        std::span<const int64_t>(raw_shape.data(), raw_shape.size()),
+        std::span<const int64_t>(scratch.raw_shape.data(), scratch.raw_shape.size()),
         decoder_impl.config.sample_rate,
         decoder_impl.config.normalize_waveform,
         decoder_impl.config.waveform_gain
@@ -1253,6 +1272,12 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoderStream::decode(
     result.inference_ms = inference_ms;
     result.postprocess_ms = postprocess_ms;
     result.backend = "gotst_native_stateful_stream";
+    result.provider_requested = decoder_impl.config.provider_requested.empty()
+        ? decoder_impl.config.provider
+        : decoder_impl.config.provider_requested;
+    result.provider_effective = decoder_impl.config.provider;
+    result.cpu_fallback_node_count = -1;
+    result.fixed_shape = decoder_impl.fixed_shape_decoder;
     return result;
 }
 
