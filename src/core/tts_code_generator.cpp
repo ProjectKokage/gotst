@@ -154,6 +154,70 @@ Error copy_embedding_vector(const F32EmbeddingTable &table,
     return Error::ok();
 }
 
+bool fill_position_layout_fast(
+    std::span<const int32_t> base_positions,
+    int32_t n_tokens,
+    int32_t n_pos_per_embd,
+    std::vector<int32_t> &out
+) {
+    if(n_tokens < 0 || n_pos_per_embd <= 0) {
+        return false;
+    }
+    const size_t token_count = static_cast<size_t>(n_tokens);
+    if(!base_positions.empty() && base_positions.size() != token_count) {
+        return false;
+    }
+
+    if(n_pos_per_embd == 1) {
+        out.resize(token_count);
+        for(int32_t index = 0; index < n_tokens; ++index) {
+            out[static_cast<size_t>(index)] =
+                base_positions.empty() ? index : base_positions[static_cast<size_t>(index)];
+        }
+        return true;
+    }
+
+    if(n_pos_per_embd != 3 && n_pos_per_embd != 4) {
+        return false;
+    }
+
+    out.resize(token_count * static_cast<size_t>(n_pos_per_embd));
+    for(int32_t index = 0; index < n_tokens; ++index) {
+        const int32_t base =
+            base_positions.empty() ? index : base_positions[static_cast<size_t>(index)];
+        out[static_cast<size_t>(index)] = base;
+        out[static_cast<size_t>(n_tokens + index)] = base;
+        out[static_cast<size_t>((n_tokens * 2) + index)] = base;
+        if(n_pos_per_embd == 4) {
+            out[static_cast<size_t>((n_tokens * 3) + index)] = 0;
+        }
+    }
+    return true;
+}
+
+Error fill_position_layout_checked(
+    std::span<const int32_t> base_positions,
+    int32_t n_tokens,
+    int32_t n_pos_per_embd,
+    std::vector<int32_t> &out,
+    const std::string &message
+) {
+    if(fill_position_layout_fast(base_positions, n_tokens, n_pos_per_embd, out)) {
+        return Error::ok();
+    }
+
+    auto err = godot_llama::normalize_position_layout(
+        base_positions,
+        n_tokens,
+        n_pos_per_embd,
+        out
+    );
+    if(err) {
+        return Error::inference_failed(message + err.message);
+    }
+    return Error::ok();
+}
+
 } // namespace
 
 struct TtsCodeGenerator::Impl {
@@ -354,16 +418,15 @@ Result<TtsGenerateResult> TtsCodeGenerator::run_generation_impl(std::span<const 
 
     impl_->talker_ctx.clear_kv_cache();
 
-    std::vector<int32_t> base_positions(static_cast<size_t>(language_length));
-    std::iota(base_positions.begin(), base_positions.end(), 0);
-    auto talker_pos_err = godot_llama::normalize_position_layout(
-        base_positions,
+    auto talker_pos_err = fill_position_layout_checked(
+        {},
         language_length,
         talker_pos_components,
-        talker_positions
+        talker_positions,
+        "Talker position layout failed: "
     );
-    if(talker_pos_err) {
-        return Error::inference_failed("Talker position layout failed: " + talker_pos_err.message);
+    if(!talker_pos_err.is_ok()) {
+        return talker_pos_err;
     }
 
     auto t0 = Clock::now();
@@ -381,14 +444,15 @@ Result<TtsGenerateResult> TtsCodeGenerator::run_generation_impl(std::span<const 
 
     if(residual_groups > 0) {
         const std::array<int32_t, 2> predictor_prefill_base = {0, 1};
-        auto predictor_pos_err = godot_llama::normalize_position_layout(
+        auto predictor_pos_err = fill_position_layout_checked(
             predictor_prefill_base,
             2,
             predictor_pos_components,
-            predictor_prefill_positions
+            predictor_prefill_positions,
+            "Predictor position layout failed: "
         );
-        if(predictor_pos_err) {
-            return Error::inference_failed("Predictor position layout failed: " + predictor_pos_err.message);
+        if(!predictor_pos_err.is_ok()) {
+            return predictor_pos_err;
         }
     }
 
@@ -548,17 +612,15 @@ Result<TtsGenerateResult> TtsCodeGenerator::run_generation_impl(std::span<const 
                     }
 
                     next_position_base[0] = pred_length;
-                    auto next_pos_err = godot_llama::normalize_position_layout(
+                    auto next_pos_err = fill_position_layout_checked(
                         next_position_base,
                         1,
                         predictor_pos_components,
-                        next_predictor_positions
+                        next_predictor_positions,
+                        "Predictor next position layout failed at group " + std::to_string(group) + ": "
                     );
-                    if(next_pos_err) {
-                        return Error::inference_failed(
-                            "Predictor next position layout failed at group " + std::to_string(group) + ": " +
-                            next_pos_err.message
-                        );
+                    if(!next_pos_err.is_ok()) {
+                        return next_pos_err;
                     }
 
                     auto t_incr = Clock::now();
@@ -631,17 +693,15 @@ Result<TtsGenerateResult> TtsCodeGenerator::run_generation_impl(std::span<const 
         }
 
         next_position_base[0] = language_length;
-        auto next_talker_pos_err = godot_llama::normalize_position_layout(
+        auto next_talker_pos_err = fill_position_layout_checked(
             next_position_base,
             1,
             talker_pos_components,
-            next_talker_positions
+            next_talker_positions,
+            "Talker next position layout failed at frame " + std::to_string(frame) + ": "
         );
-        if(next_talker_pos_err) {
-            return Error::inference_failed(
-                "Talker next position layout failed at frame " + std::to_string(frame) + ": " +
-                next_talker_pos_err.message
-            );
+        if(!next_talker_pos_err.is_ok()) {
+            return next_talker_pos_err;
         }
 
         auto t_talker = Clock::now();

@@ -119,6 +119,40 @@ PackedFloat32Array pack_float_array(const std::vector<float> &values) {
     return packed;
 }
 
+std::vector<float> copy_float_vector(const PackedFloat32Array &values) {
+    std::vector<float> copied(static_cast<size_t>(values.size()));
+    if(values.size() > 0) {
+        std::memcpy(copied.data(), values.ptr(), static_cast<size_t>(values.size()) * sizeof(float));
+    }
+    return copied;
+}
+
+gotst::TtsSamplingConfig tts_sampling_from_params(const Dictionary &params) {
+    gotst::TtsSamplingConfig sampling;
+    sampling.codebook_size = static_cast<int32_t>(params.get("codebook_size", 2048));
+    sampling.residual_groups = static_cast<int32_t>(params.get("residual_groups", 15));
+    sampling.target_frames = static_cast<int32_t>(params.get("target_frames", 96));
+    sampling.min_frames_before_eos = static_cast<int32_t>(params.get("min_frames_before_eos", 8));
+    sampling.hidden_size = static_cast<int32_t>(params.get("hidden_size", 1024));
+    sampling.eos_token_id = static_cast<int32_t>(params.get("eos_token_id", 2150));
+    sampling.eos_logit_margin = static_cast<float>(params.get("eos_logit_margin", 0.0));
+    sampling.do_sample = static_cast<bool>(params.get("do_sample", true));
+    sampling.top_k = static_cast<int32_t>(params.get("top_k", 50));
+    sampling.top_p = static_cast<float>(params.get("top_p", 1.0));
+    sampling.temperature = static_cast<float>(params.get("temperature", 0.9));
+    sampling.sub_do_sample = static_cast<bool>(params.get("sub_do_sample", true));
+    sampling.sub_top_k = static_cast<int32_t>(params.get("sub_top_k", 50));
+    sampling.sub_top_p = static_cast<float>(params.get("sub_top_p", 1.0));
+    sampling.sub_temperature = static_cast<float>(params.get("sub_temperature", 0.9));
+    sampling.repetition_penalty = static_cast<float>(params.get("repetition_penalty", 1.05));
+    sampling.rng_seed = static_cast<int64_t>(params.get("rng_seed", 1));
+    return sampling;
+}
+
+int64_t round_ms(double value) {
+    return static_cast<int64_t>(std::llround(std::max(0.0, value)));
+}
+
 Dictionary pack_tts_prompt_result(const gotst::TtsPromptAssemblyResult &result) {
     Dictionary payload;
     payload["language_sequence"] = pack_float_array(result.language_sequence);
@@ -137,6 +171,8 @@ Dictionary pack_tts_prompt_result(const gotst::TtsPromptAssemblyResult &result) 
 } // namespace
 
 GotstSpeechRuntime::~GotstSpeechRuntime() {
+    stop_waveform_stream_workers();
+
     // Keep the GGUF-backed speech decoders alive until process exit. On macOS
     // headless shutdown, destroying their llama contexts during RefCounted
     // teardown can raise std::system_error("mutex lock failed") inside the
@@ -322,18 +358,6 @@ void GotstSpeechRuntime::_bind_methods() {
     ClassDB::bind_method(
         D_METHOD("generate_tts_codes", "params"),
         &GotstSpeechRuntime::generate_tts_codes
-    );
-    ClassDB::bind_method(
-        D_METHOD("generate_tts_codes_streaming", "params", "request_id", "chunk_frames"),
-        &GotstSpeechRuntime::generate_tts_codes_streaming
-    );
-    ClassDB::bind_method(
-        D_METHOD("poll_tts_stream"),
-        &GotstSpeechRuntime::poll_tts_stream
-    );
-    ClassDB::bind_method(
-        D_METHOD("cancel_tts_stream"),
-        &GotstSpeechRuntime::cancel_tts_stream
     );
     ClassDB::bind_method(
         D_METHOD("start_tts_waveform_stream", "params", "request_id", "chunk_frames"),
@@ -1776,112 +1800,6 @@ Dictionary GotstSpeechRuntime::generate_tts_codes(const Dictionary &params) {
     return output;
 }
 
-Dictionary GotstSpeechRuntime::generate_tts_codes_streaming(const Dictionary &params, int64_t request_id, int64_t chunk_frames) {
-    Dictionary output;
-    if (!tts_code_generator_ || !tts_code_generator_->is_loaded()) {
-        output["error"] = "TTS code generator is not loaded.";
-        return output;
-    }
-
-    stream_cancel_.reset();
-    stream_active_.store(true, std::memory_order_release);
-
-    const PackedFloat32Array initial_input = params.get("initial_language_input", PackedFloat32Array());
-    const int32_t initial_length = static_cast<int32_t>(params.get("initial_sequence_length", 0));
-    const PackedFloat32Array trailing_hidden = params.get("trailing_text_hidden", PackedFloat32Array());
-    const int32_t trailing_length = static_cast<int32_t>(params.get("trailing_text_length", 0));
-    const PackedFloat32Array pad_embedding = params.get("tts_pad_embedding", PackedFloat32Array());
-
-    gotst::TtsSamplingConfig sampling;
-    sampling.codebook_size = static_cast<int32_t>(params.get("codebook_size", 2048));
-    sampling.residual_groups = static_cast<int32_t>(params.get("residual_groups", 15));
-    sampling.target_frames = static_cast<int32_t>(params.get("target_frames", 96));
-    sampling.min_frames_before_eos = static_cast<int32_t>(params.get("min_frames_before_eos", 8));
-    sampling.hidden_size = static_cast<int32_t>(params.get("hidden_size", 1024));
-    sampling.eos_token_id = static_cast<int32_t>(params.get("eos_token_id", 2150));
-    sampling.eos_logit_margin = static_cast<float>(params.get("eos_logit_margin", 0.0));
-    sampling.do_sample = static_cast<bool>(params.get("do_sample", true));
-    sampling.top_k = static_cast<int32_t>(params.get("top_k", 50));
-    sampling.top_p = static_cast<float>(params.get("top_p", 1.0));
-    sampling.temperature = static_cast<float>(params.get("temperature", 0.9));
-    sampling.sub_do_sample = static_cast<bool>(params.get("sub_do_sample", true));
-    sampling.sub_top_k = static_cast<int32_t>(params.get("sub_top_k", 50));
-    sampling.sub_top_p = static_cast<float>(params.get("sub_top_p", 1.0));
-    sampling.sub_temperature = static_cast<float>(params.get("sub_temperature", 0.9));
-    sampling.repetition_penalty = static_cast<float>(params.get("repetition_penalty", 1.05));
-    sampling.rng_seed = static_cast<int64_t>(params.get("rng_seed", 1));
-
-    auto on_chunk = [this, request_id](gotst::TtsFrameChunk chunk) {
-        StreamEvent event;
-        event.request_id = request_id;
-        event.frame_count = chunk.frame_count;
-        event.codes_per_frame = chunk.codes_per_frame;
-        event.is_final = chunk.is_final;
-        event.codes.resize(static_cast<int64_t>(chunk.codes.size()));
-        if (!chunk.codes.empty()) {
-            memcpy(event.codes.ptrw(), chunk.codes.data(), chunk.codes.size() * sizeof(int64_t));
-        }
-        std::lock_guard<std::mutex> lock(stream_mutex_);
-        stream_queue_.push(std::move(event));
-    };
-
-    auto result = tts_code_generator_->generate_streaming(
-        {initial_input.ptr(), static_cast<size_t>(initial_input.size())},
-        initial_length,
-        {trailing_hidden.ptr(), static_cast<size_t>(trailing_hidden.size())},
-        trailing_length,
-        {pad_embedding.ptr(), static_cast<size_t>(pad_embedding.size())},
-        sampling,
-        static_cast<int32_t>(chunk_frames),
-        on_chunk,
-        &stream_cancel_
-    );
-
-    stream_active_.store(false, std::memory_order_release);
-
-    if (!result.is_ok()) {
-        StreamEvent err_event;
-        err_event.request_id = request_id;
-        err_event.is_error = true;
-        err_event.error_message = String(result.error_message().c_str());
-        std::lock_guard<std::mutex> lock(stream_mutex_);
-        stream_queue_.push(std::move(err_event));
-
-        output["error"] = String(result.error_message().c_str());
-        return output;
-    }
-
-    const auto &gen = result.value();
-    output["frame_count"] = gen.frame_count;
-    output["codes_per_frame"] = gen.codes_per_frame;
-    return output;
-}
-
-Array GotstSpeechRuntime::poll_tts_stream() {
-    Array events;
-    std::lock_guard<std::mutex> lock(stream_mutex_);
-    while (!stream_queue_.empty()) {
-        StreamEvent &ev = stream_queue_.front();
-        Dictionary d;
-        d["request_id"] = ev.request_id;
-        d["codes"] = ev.codes;
-        d["frame_count"] = ev.frame_count;
-        d["codes_per_frame"] = ev.codes_per_frame;
-        d["is_final"] = ev.is_final;
-        if (ev.is_error) {
-            d["error"] = ev.error_message;
-        }
-        events.push_back(d);
-        stream_queue_.pop();
-    }
-    return events;
-}
-
-void GotstSpeechRuntime::cancel_tts_stream() {
-    stream_cancel_.cancel();
-    stream_active_.store(false, std::memory_order_release);
-}
-
 Dictionary GotstSpeechRuntime::start_tts_waveform_stream(
     const Dictionary &params,
     int64_t request_id,
@@ -1897,192 +1815,293 @@ Dictionary GotstSpeechRuntime::start_tts_waveform_stream(
         return output;
     }
 
-    auto decoder_stream_result = tts_waveform_decoder_->create_stream();
-    if(!decoder_stream_result.is_ok()) {
-        output["error"] = String(decoder_stream_result.error_message().c_str());
-        return output;
+    ensure_waveform_stream_workers_started();
+    if(!waveform_stream_active_.load(std::memory_order_acquire)) {
+        clear_waveform_events();
     }
-    std::unique_ptr<gotst::TtsWaveformDecoderStream> decoder_stream =
-        std::move(decoder_stream_result.value());
-
-    {
-        std::lock_guard<std::mutex> lock(waveform_stream_mutex_);
-        while(!waveform_stream_queue_.empty()) {
-            waveform_stream_queue_.pop();
-        }
-    }
-    waveform_stream_cancel_.reset();
-    waveform_stream_active_.store(true, std::memory_order_release);
 
     const PackedFloat32Array initial_input = params.get("initial_language_input", PackedFloat32Array());
-    const int32_t initial_length = static_cast<int32_t>(params.get("initial_sequence_length", 0));
     const PackedFloat32Array trailing_hidden = params.get("trailing_text_hidden", PackedFloat32Array());
-    const int32_t trailing_length = static_cast<int32_t>(params.get("trailing_text_length", 0));
     const PackedFloat32Array pad_embedding = params.get("tts_pad_embedding", PackedFloat32Array());
 
-    gotst::TtsSamplingConfig sampling;
-    sampling.codebook_size = static_cast<int32_t>(params.get("codebook_size", 2048));
-    sampling.residual_groups = static_cast<int32_t>(params.get("residual_groups", 15));
-    sampling.target_frames = static_cast<int32_t>(params.get("target_frames", 96));
-    sampling.min_frames_before_eos = static_cast<int32_t>(params.get("min_frames_before_eos", 8));
-    sampling.hidden_size = static_cast<int32_t>(params.get("hidden_size", 1024));
-    sampling.eos_token_id = static_cast<int32_t>(params.get("eos_token_id", 2150));
-    sampling.eos_logit_margin = static_cast<float>(params.get("eos_logit_margin", 0.0));
-    sampling.do_sample = static_cast<bool>(params.get("do_sample", true));
-    sampling.top_k = static_cast<int32_t>(params.get("top_k", 50));
-    sampling.top_p = static_cast<float>(params.get("top_p", 1.0));
-    sampling.temperature = static_cast<float>(params.get("temperature", 0.9));
-    sampling.sub_do_sample = static_cast<bool>(params.get("sub_do_sample", true));
-    sampling.sub_top_k = static_cast<int32_t>(params.get("sub_top_k", 50));
-    sampling.sub_top_p = static_cast<float>(params.get("sub_top_p", 1.0));
-    sampling.sub_temperature = static_cast<float>(params.get("sub_temperature", 0.9));
-    sampling.repetition_penalty = static_cast<float>(params.get("repetition_penalty", 1.05));
-    sampling.rng_seed = static_cast<int64_t>(params.get("rng_seed", 1));
+    WaveformStreamRequest request;
+    request.request_id = request_id;
+    request.initial_input = copy_float_vector(initial_input);
+    request.initial_length = static_cast<int32_t>(params.get("initial_sequence_length", 0));
+    request.trailing_hidden = copy_float_vector(trailing_hidden);
+    request.trailing_length = static_cast<int32_t>(params.get("trailing_text_length", 0));
+    request.pad_embedding = copy_float_vector(pad_embedding);
+    request.sampling = tts_sampling_from_params(params);
+    request.chunk_frames = static_cast<int32_t>(std::max<int64_t>(1, chunk_frames));
+    request.queued_at = std::chrono::steady_clock::now();
+    request.cancel = std::make_shared<gotst::CancellationToken>();
+    {
+        std::lock_guard<std::mutex> lock(waveform_request_mutex_);
+        waveform_request_queue_.push_back(std::move(request));
+        waveform_stream_active_.store(true, std::memory_order_release);
+    }
+    waveform_request_cv_.notify_one();
 
+    output["started"] = true;
+    output["request_id"] = request_id;
+    return output;
+}
+
+void GotstSpeechRuntime::ensure_waveform_stream_workers_started() {
+    waveform_workers_stop_.store(false, std::memory_order_release);
+    if(!waveform_decoder_worker_.joinable()) {
+        waveform_decoder_worker_ = std::thread(&GotstSpeechRuntime::waveform_decoder_worker_main, this);
+    }
+    if(!waveform_generation_worker_.joinable()) {
+        waveform_generation_worker_ = std::thread(&GotstSpeechRuntime::waveform_generation_worker_main, this);
+    }
+}
+
+void GotstSpeechRuntime::stop_waveform_stream_workers() {
+    waveform_workers_stop_.store(true, std::memory_order_release);
+    if(waveform_active_cancel_) {
+        waveform_active_cancel_->cancel();
+    }
+    {
+        std::lock_guard<std::mutex> lock(waveform_request_mutex_);
+        for(auto &request : waveform_request_queue_) {
+            if(request.cancel) {
+                request.cancel->cancel();
+            }
+        }
+        waveform_request_queue_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(waveform_decode_mutex_);
+        for(auto &job : waveform_decode_queue_) {
+            if(job.cancel) {
+                job.cancel->cancel();
+            }
+        }
+        waveform_decode_queue_.clear();
+    }
+    waveform_request_cv_.notify_all();
+    waveform_decode_cv_.notify_all();
+    if(waveform_generation_worker_.joinable()) {
+        waveform_generation_worker_.join();
+    }
+    if(waveform_decoder_worker_.joinable()) {
+        waveform_decoder_worker_.join();
+    }
+    waveform_stream_active_.store(false, std::memory_order_release);
+}
+
+void GotstSpeechRuntime::push_waveform_event(WaveformStreamEvent event) {
+    std::lock_guard<std::mutex> lock(waveform_stream_mutex_);
+    waveform_stream_queue_.push(std::move(event));
+}
+
+void GotstSpeechRuntime::clear_waveform_events() {
+    std::lock_guard<std::mutex> lock(waveform_stream_mutex_);
+    while(!waveform_stream_queue_.empty()) {
+        waveform_stream_queue_.pop();
+    }
+}
+
+void GotstSpeechRuntime::waveform_generation_worker_main() {
     using Clock = std::chrono::steady_clock;
     using Ms = std::chrono::duration<double, std::milli>;
-    const auto stream_start = Clock::now();
 
-    struct DecodeJob {
-        std::vector<int64_t> codes;
-        int32_t frame_count = 0;
-        int32_t codes_per_frame = 0;
-        bool is_final = false;
-        double codegen_ms = 0.0;
-        Clock::time_point queued_at;
-    };
-
-    std::mutex job_mutex;
-    std::condition_variable job_cv;
-    std::deque<DecodeJob> jobs;
-    bool generation_done = false;
-    bool decoder_failed = false;
-
-    auto push_waveform_event = [this](WaveformStreamEvent event) {
-        std::lock_guard<std::mutex> lock(waveform_stream_mutex_);
-        waveform_stream_queue_.push(std::move(event));
-    };
-
-    std::thread decoder_thread([&, request_id]() {
-        while(true) {
-            DecodeJob job;
-            {
-                std::unique_lock<std::mutex> lock(job_mutex);
-                job_cv.wait(lock, [&]() {
-                    return generation_done || !jobs.empty() || waveform_stream_cancel_.is_cancelled();
-                });
-                if((jobs.empty() && generation_done) || waveform_stream_cancel_.is_cancelled()) {
-                    break;
-                }
-                job = std::move(jobs.front());
-                jobs.pop_front();
-            }
-
-            const auto decode_started = Clock::now();
-            const double queue_wait_ms = Ms(decode_started - job.queued_at).count();
-            auto decoded_result = decoder_stream->decode(
-                std::span<const int64_t>(job.codes.data(), job.codes.size()),
-                job.frame_count,
-                job.is_final
-            );
-            const auto event_time = Clock::now();
-            if(!decoded_result.is_ok()) {
-                WaveformStreamEvent event;
-                event.request_id = request_id;
-                event.is_error = true;
-                event.error_message = String(decoded_result.error_message().c_str());
-                event.elapsed_ms = static_cast<int64_t>(std::llround(Ms(event_time - stream_start).count()));
-                event.codegen_ms = static_cast<int64_t>(std::llround(job.codegen_ms));
-                event.queue_wait_ms = static_cast<int64_t>(std::llround(queue_wait_ms));
-                push_waveform_event(std::move(event));
-                waveform_stream_cancel_.cancel();
-                decoder_failed = true;
-                break;
-            }
-
-            const auto &decoded = decoded_result.value();
-            WaveformStreamEvent event;
-            event.request_id = request_id;
-            event.waveform = pack_float_array(decoded.waveform);
-            event.sample_rate = tts_waveform_decoder_sample_rate_;
-            event.frame_count = job.frame_count;
-            event.code_count = static_cast<int32_t>(job.codes.size());
-            event.is_final = job.is_final;
-            event.elapsed_ms = static_cast<int64_t>(std::llround(Ms(event_time - stream_start).count()));
-            event.codegen_ms = static_cast<int64_t>(std::llround(job.codegen_ms));
-            event.decoder_ms = static_cast<int64_t>(std::llround(decoded.elapsed_ms));
-            event.decoder_inference_ms = static_cast<int64_t>(std::llround(decoded.inference_ms));
-            event.decoder_postprocess_ms = static_cast<int64_t>(std::llround(decoded.postprocess_ms));
-            event.queue_wait_ms = static_cast<int64_t>(std::llround(queue_wait_ms));
-            push_waveform_event(std::move(event));
-            if(job.is_final) {
-                break;
-            }
-        }
-    });
-
-    auto on_chunk = [&](gotst::TtsFrameChunk chunk) {
-        if(waveform_stream_cancel_.is_cancelled()) {
-            return;
-        }
-        DecodeJob job;
-        job.codes = std::move(chunk.codes);
-        job.frame_count = chunk.frame_count;
-        job.codes_per_frame = chunk.codes_per_frame;
-        job.is_final = chunk.is_final;
-        job.codegen_ms = Ms(Clock::now() - stream_start).count();
-        job.queued_at = Clock::now();
+    while(!waveform_workers_stop_.load(std::memory_order_acquire)) {
+        WaveformStreamRequest request;
         {
-            std::lock_guard<std::mutex> lock(job_mutex);
-            jobs.push_back(std::move(job));
+            std::unique_lock<std::mutex> lock(waveform_request_mutex_);
+            waveform_request_cv_.wait(lock, [&]() {
+                return waveform_workers_stop_.load(std::memory_order_acquire) || !waveform_request_queue_.empty();
+            });
+            if(waveform_workers_stop_.load(std::memory_order_acquire)) {
+                break;
+            }
+            request = std::move(waveform_request_queue_.front());
+            waveform_request_queue_.pop_front();
+            waveform_active_request_id_ = request.request_id;
+            waveform_active_cancel_ = request.cancel;
+            waveform_stream_active_.store(true, std::memory_order_release);
         }
-        job_cv.notify_one();
-    };
 
-    auto result = tts_code_generator_->generate_streaming(
-        {initial_input.ptr(), static_cast<size_t>(initial_input.size())},
-        initial_length,
-        {trailing_hidden.ptr(), static_cast<size_t>(trailing_hidden.size())},
-        trailing_length,
-        {pad_embedding.ptr(), static_cast<size_t>(pad_embedding.size())},
-        sampling,
-        static_cast<int32_t>(chunk_frames),
-        on_chunk,
-        &waveform_stream_cancel_
-    );
+        const auto stream_start = Clock::now();
+        const double pipeline_queue_wait_ms = Ms(stream_start - request.queued_at).count();
 
-    {
-        std::lock_guard<std::mutex> lock(job_mutex);
-        generation_done = true;
+        auto decoder_stream_result = tts_waveform_decoder_->create_stream();
+        if(!decoder_stream_result.is_ok()) {
+            WaveformStreamEvent event;
+            event.request_id = request.request_id;
+            event.is_error = true;
+            event.error_message = String(decoder_stream_result.error_message().c_str());
+            event.elapsed_ms = round_ms(Ms(Clock::now() - stream_start).count());
+            event.pipeline_queue_wait_ms = round_ms(pipeline_queue_wait_ms);
+            push_waveform_event(std::move(event));
+            waveform_stream_active_.store(false, std::memory_order_release);
+            continue;
+        }
+
+        std::shared_ptr<gotst::TtsWaveformDecoderStream> decoder_stream(
+            std::move(decoder_stream_result.value())
+        );
+
+        int32_t chunk_index = 0;
+        auto on_chunk = [
+            this,
+            &request,
+            decoder_stream,
+            stream_start,
+            pipeline_queue_wait_ms,
+            &chunk_index
+        ](
+            gotst::TtsFrameChunk chunk
+        ) {
+            if(request.cancel && request.cancel->is_cancelled()) {
+                return;
+            }
+
+            WaveformDecodeJob job;
+            job.request_id = request.request_id;
+            job.decoder_stream = decoder_stream;
+            job.cancel = request.cancel;
+            job.codes = std::move(chunk.codes);
+            job.frame_count = chunk.frame_count;
+            job.codes_per_frame = chunk.codes_per_frame;
+            job.chunk_index = ++chunk_index;
+            job.is_final = chunk.is_final;
+            job.codegen_ms = Ms(Clock::now() - stream_start).count();
+            job.pipeline_queue_wait_ms = pipeline_queue_wait_ms;
+            job.stream_start = stream_start;
+            job.queued_at = Clock::now();
+            {
+                std::lock_guard<std::mutex> lock(waveform_decode_mutex_);
+                waveform_decode_queue_.push_back(std::move(job));
+            }
+            waveform_decode_cv_.notify_one();
+        };
+
+        auto result = tts_code_generator_->generate_streaming(
+            {request.initial_input.data(), request.initial_input.size()},
+            request.initial_length,
+            {request.trailing_hidden.data(), request.trailing_hidden.size()},
+            request.trailing_length,
+            {request.pad_embedding.data(), request.pad_embedding.size()},
+            request.sampling,
+            request.chunk_frames,
+            on_chunk,
+            request.cancel.get()
+        );
+
+        if(!result.is_ok()) {
+            if(!request.cancel || !request.cancel->is_cancelled()) {
+                WaveformStreamEvent event;
+                event.request_id = request.request_id;
+                event.is_error = true;
+                event.error_message = String(result.error_message().c_str());
+                event.elapsed_ms = round_ms(Ms(Clock::now() - stream_start).count());
+                event.pipeline_queue_wait_ms = round_ms(pipeline_queue_wait_ms);
+                push_waveform_event(std::move(event));
+            }
+        } else {
+            const auto &gen = result.value();
+            WaveformStreamEvent event;
+            event.request_id = request.request_id;
+            event.is_stats = true;
+            event.frame_count = gen.frame_count;
+            event.code_count = static_cast<int32_t>(gen.codes.size());
+            event.elapsed_ms = round_ms(Ms(Clock::now() - stream_start).count());
+            event.codegen_ms = round_ms(gen.elapsed_ms);
+            event.pipeline_queue_wait_ms = round_ms(pipeline_queue_wait_ms);
+            event.talker_prefill_ms = round_ms(gen.talker_prefill_ms);
+            event.talker_decode_ms = round_ms(gen.talker_decode_ms);
+            event.predictor_ms = round_ms(gen.predictor_ms);
+            event.onnx_embedding_ms = round_ms(gen.onnx_embedding_ms);
+            event.codegen_other_ms = round_ms(gen.other_ms);
+            push_waveform_event(std::move(event));
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(waveform_request_mutex_);
+            if(waveform_active_request_id_ == request.request_id) {
+                waveform_active_request_id_ = 0;
+                waveform_active_cancel_.reset();
+            }
+        }
+        if(!request.cancel || !request.cancel->is_cancelled()) {
+            waveform_stream_active_.store(false, std::memory_order_release);
+        }
     }
-    job_cv.notify_one();
-    if(decoder_thread.joinable()) {
-        decoder_thread.join();
+}
+
+void GotstSpeechRuntime::waveform_decoder_worker_main() {
+    using Clock = std::chrono::steady_clock;
+    using Ms = std::chrono::duration<double, std::milli>;
+
+    while(!waveform_workers_stop_.load(std::memory_order_acquire)) {
+        WaveformDecodeJob job;
+        {
+            std::unique_lock<std::mutex> lock(waveform_decode_mutex_);
+            waveform_decode_cv_.wait(lock, [&]() {
+                return waveform_workers_stop_.load(std::memory_order_acquire) || !waveform_decode_queue_.empty();
+            });
+            if(waveform_workers_stop_.load(std::memory_order_acquire)) {
+                break;
+            }
+            job = std::move(waveform_decode_queue_.front());
+            waveform_decode_queue_.pop_front();
+        }
+
+        if((job.cancel && job.cancel->is_cancelled()) || !job.decoder_stream) {
+            continue;
+        }
+
+        const auto decode_started = Clock::now();
+        const double queue_wait_ms = Ms(decode_started - job.queued_at).count();
+        auto decoded_result = job.decoder_stream->decode(
+            std::span<const int64_t>(job.codes.data(), job.codes.size()),
+            job.frame_count,
+            job.is_final
+        );
+
+        if(!decoded_result.is_ok()) {
+            WaveformStreamEvent event;
+            event.request_id = job.request_id;
+            event.is_error = true;
+            event.error_message = String(decoded_result.error_message().c_str());
+            event.elapsed_ms = round_ms(Ms(Clock::now() - job.stream_start).count());
+            event.codegen_ms = round_ms(job.codegen_ms);
+            event.queue_wait_ms = round_ms(queue_wait_ms);
+            event.pipeline_queue_wait_ms = round_ms(job.pipeline_queue_wait_ms);
+            push_waveform_event(std::move(event));
+            if(job.cancel) {
+                job.cancel->cancel();
+            }
+            continue;
+        }
+
+        const auto &decoded = decoded_result.value();
+        const auto pack_started = Clock::now();
+        PackedFloat32Array waveform = pack_float_array(decoded.waveform);
+        const double pack_ms = Ms(Clock::now() - pack_started).count();
+
+        WaveformStreamEvent event;
+        event.request_id = job.request_id;
+        event.waveform = std::move(waveform);
+        event.sample_rate = tts_waveform_decoder_sample_rate_;
+        event.frame_count = job.frame_count;
+        event.code_count = static_cast<int32_t>(job.codes.size());
+        event.chunk_index = job.chunk_index;
+        event.chunk_samples = static_cast<int32_t>(decoded.waveform.size());
+        event.is_final = job.is_final;
+        event.elapsed_ms = round_ms(Ms(Clock::now() - job.stream_start).count());
+        event.codegen_ms = round_ms(job.codegen_ms);
+        event.decoder_ms = round_ms(decoded.elapsed_ms);
+        event.decoder_inference_ms = round_ms(decoded.inference_ms);
+        event.decoder_postprocess_ms = round_ms(decoded.postprocess_ms);
+        event.queue_wait_ms = round_ms(queue_wait_ms);
+        event.pipeline_queue_wait_ms = round_ms(job.pipeline_queue_wait_ms);
+        event.native_pack_ms = round_ms(pack_ms);
+        push_waveform_event(std::move(event));
     }
-
-    waveform_stream_active_.store(false, std::memory_order_release);
-
-    if(!result.is_ok() && !decoder_failed) {
-        WaveformStreamEvent err_event;
-        err_event.request_id = request_id;
-        err_event.is_error = true;
-        err_event.error_message = String(result.error_message().c_str());
-        err_event.elapsed_ms = static_cast<int64_t>(std::llround(Ms(Clock::now() - stream_start).count()));
-        push_waveform_event(std::move(err_event));
-
-        output["error"] = String(result.error_message().c_str());
-        return output;
-    }
-
-    if(result.is_ok()) {
-        const auto &gen = result.value();
-        output["frame_count"] = gen.frame_count;
-        output["codes_per_frame"] = gen.codes_per_frame;
-        output["elapsed_ms"] = static_cast<int64_t>(std::llround(gen.elapsed_ms));
-    } else if(decoder_failed) {
-        output["error"] = "TTS waveform decoder failed.";
-    }
-    return output;
 }
 
 Array GotstSpeechRuntime::poll_tts_waveform_stream() {
@@ -2096,13 +2115,23 @@ Array GotstSpeechRuntime::poll_tts_waveform_stream() {
         d["sample_rate"] = ev.sample_rate;
         d["frame_count"] = ev.frame_count;
         d["code_count"] = ev.code_count;
+        d["chunk_index"] = ev.chunk_index;
+        d["chunk_samples"] = ev.chunk_samples;
         d["is_final"] = ev.is_final;
+        d["is_stats"] = ev.is_stats;
         d["elapsed_ms"] = ev.elapsed_ms;
         d["codegen_ms"] = ev.codegen_ms;
         d["decoder_ms"] = ev.decoder_ms;
         d["decoder_inference_ms"] = ev.decoder_inference_ms;
         d["decoder_postprocess_ms"] = ev.decoder_postprocess_ms;
         d["queue_wait_ms"] = ev.queue_wait_ms;
+        d["pipeline_queue_wait_ms"] = ev.pipeline_queue_wait_ms;
+        d["native_pack_ms"] = ev.native_pack_ms;
+        d["talker_prefill_ms"] = ev.talker_prefill_ms;
+        d["talker_decode_ms"] = ev.talker_decode_ms;
+        d["predictor_ms"] = ev.predictor_ms;
+        d["onnx_embedding_ms"] = ev.onnx_embedding_ms;
+        d["codegen_other_ms"] = ev.codegen_other_ms;
         if(ev.is_error) {
             d["error"] = ev.error_message;
         }
@@ -2113,12 +2142,44 @@ Array GotstSpeechRuntime::poll_tts_waveform_stream() {
 }
 
 void GotstSpeechRuntime::cancel_tts_waveform_stream(int64_t request_id) {
-    (void)request_id;
-    waveform_stream_cancel_.cancel();
+    std::shared_ptr<gotst::CancellationToken> active_cancel;
+    {
+        std::lock_guard<std::mutex> lock(waveform_request_mutex_);
+        if(request_id <= 0 || waveform_active_request_id_ == request_id) {
+            active_cancel = waveform_active_cancel_;
+        }
+
+        for(auto it = waveform_request_queue_.begin(); it != waveform_request_queue_.end();) {
+            if(request_id <= 0 || it->request_id == request_id) {
+                if(it->cancel) {
+                    it->cancel->cancel();
+                }
+                it = waveform_request_queue_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    if(active_cancel) {
+        active_cancel->cancel();
+    }
+    {
+        std::lock_guard<std::mutex> lock(waveform_decode_mutex_);
+        for(auto &job : waveform_decode_queue_) {
+            if(request_id <= 0 || job.request_id == request_id) {
+                if(job.cancel) {
+                    job.cancel->cancel();
+                }
+            }
+        }
+    }
+    waveform_decode_cv_.notify_all();
     waveform_stream_active_.store(false, std::memory_order_release);
 }
 
 bool GotstSpeechRuntime::load_tts_waveform_decoder(const Dictionary &config) {
+    stop_waveform_stream_workers();
+
     gotst::TtsWaveformDecoderConfig decoder_config;
     decoder_config.decoder_onnx_path = String(config.get("decoder_onnx_path", "")).utf8().get_data();
     decoder_config.provider = String(config.get("provider", "CPU")).utf8().get_data();

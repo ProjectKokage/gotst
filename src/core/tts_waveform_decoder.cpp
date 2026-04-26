@@ -196,6 +196,7 @@ struct StatefulDecodeScratch {
     std::vector<int64_t> is_last_shape = {1};
     std::vector<Ort::Value> inputs;
     std::vector<float> raw_waveform;
+    std::unique_ptr<Ort::MemoryInfo> memory_info;
 };
 
 int32_t parse_stateful_index(const std::string &name, std::string_view prefix) {
@@ -902,6 +903,11 @@ void TtsWaveformDecoderStream::reset() {
     impl_->scratch.inputs.reserve(decoder_impl.stateful_input_bindings.size());
     impl_->scratch.chunk_codes.clear();
     impl_->scratch.raw_waveform.clear();
+    if(!impl_->scratch.memory_info) {
+        impl_->scratch.memory_info = std::make_unique<Ort::MemoryInfo>(
+            Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)
+        );
+    }
     impl_->state_initialized = true;
 }
 
@@ -947,11 +953,16 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoderStream::decode(
     using Ms = std::chrono::duration<double, std::milli>;
 
     const auto decode_start = Clock::now();
-    auto memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
     const int32_t chunk_frames_limit = std::max<int32_t>(1, decoder_impl.config.stateful_chunk_frames);
     const int32_t num_layers = decoder_impl.stateful_num_layers;
     StatefulDecodeState &state = impl_->state;
     StatefulDecodeScratch &scratch = impl_->scratch;
+    if(!scratch.memory_info) {
+        scratch.memory_info = std::make_unique<Ort::MemoryInfo>(
+            Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)
+        );
+    }
+    Ort::MemoryInfo &memory_info = *scratch.memory_info;
     scratch.inputs.reserve(decoder_impl.stateful_input_bindings.size());
     scratch.chunk_codes.reserve(
         static_cast<size_t>(chunk_frames_limit) * static_cast<size_t>(target_quantizers)
@@ -961,29 +972,40 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoderStream::decode(
 
     double inference_ms = 0.0;
     float zero_float = 0.0f;
+    const bool can_use_direct_codes =
+        decoder_impl.input_quantizer_axis != 1 && target_quantizers == codes_per_frame;
     for(int32_t frame_offset = 0; frame_offset < frame_count; frame_offset += chunk_frames_limit) {
         const int32_t chunk_frames = std::min(chunk_frames_limit, frame_count - frame_offset);
         const bool chunk_is_final = is_final && (frame_offset + chunk_frames) >= frame_count;
-        scratch.chunk_codes.assign(
-            static_cast<size_t>(chunk_frames) * static_cast<size_t>(target_quantizers),
-            int64_t {0}
-        );
-        const int32_t copy_quantizers = std::min(codes_per_frame, target_quantizers);
-        for(int32_t frame_index = 0; frame_index < chunk_frames; ++frame_index) {
-            for(int32_t quantizer_index = 0; quantizer_index < copy_quantizers; ++quantizer_index) {
-                const size_t src_index =
-                    static_cast<size_t>(frame_offset + frame_index) * static_cast<size_t>(codes_per_frame) +
-                    static_cast<size_t>(quantizer_index);
-                size_t dst_index =
-                    static_cast<size_t>(frame_index) * static_cast<size_t>(target_quantizers) +
-                    static_cast<size_t>(quantizer_index);
-                if(decoder_impl.input_quantizer_axis == 1) {
-                    dst_index =
-                        static_cast<size_t>(quantizer_index) * static_cast<size_t>(chunk_frames) +
-                        static_cast<size_t>(frame_index);
+        const bool use_direct_codes = can_use_direct_codes;
+        int64_t *chunk_codes_data = nullptr;
+        size_t chunk_code_count =
+            static_cast<size_t>(chunk_frames) * static_cast<size_t>(target_quantizers);
+
+        if(use_direct_codes) {
+            const size_t src_offset =
+                static_cast<size_t>(frame_offset) * static_cast<size_t>(codes_per_frame);
+            chunk_codes_data = const_cast<int64_t *>(audio_codes.data() + src_offset);
+        } else {
+            scratch.chunk_codes.assign(chunk_code_count, int64_t {0});
+            const int32_t copy_quantizers = std::min(codes_per_frame, target_quantizers);
+            for(int32_t frame_index = 0; frame_index < chunk_frames; ++frame_index) {
+                for(int32_t quantizer_index = 0; quantizer_index < copy_quantizers; ++quantizer_index) {
+                    const size_t src_index =
+                        static_cast<size_t>(frame_offset + frame_index) * static_cast<size_t>(codes_per_frame) +
+                        static_cast<size_t>(quantizer_index);
+                    size_t dst_index =
+                        static_cast<size_t>(frame_index) * static_cast<size_t>(target_quantizers) +
+                        static_cast<size_t>(quantizer_index);
+                    if(decoder_impl.input_quantizer_axis == 1) {
+                        dst_index =
+                            static_cast<size_t>(quantizer_index) * static_cast<size_t>(chunk_frames) +
+                            static_cast<size_t>(frame_index);
+                    }
+                    scratch.chunk_codes[dst_index] = audio_codes[src_index];
                 }
-                scratch.chunk_codes[dst_index] = audio_codes[src_index];
             }
+            chunk_codes_data = scratch.chunk_codes.data();
         }
 
         if(decoder_impl.input_quantizer_axis == 1) {
@@ -1000,14 +1022,14 @@ Result<TtsWaveformDecodeResult> TtsWaveformDecoderStream::decode(
         scratch.inputs.clear();
         for(const StatefulInputBinding &binding : decoder_impl.stateful_input_bindings) {
             switch(binding.kind) {
-            case StatefulInputKind::AudioCodes:
-                scratch.inputs.push_back(Ort::Value::CreateTensor<int64_t>(
-                    memory_info,
-                    scratch.chunk_codes.data(),
-                    scratch.chunk_codes.size(),
-                    scratch.chunk_shape.data(),
-                    scratch.chunk_shape.size()
-                ));
+                case StatefulInputKind::AudioCodes:
+                    scratch.inputs.push_back(Ort::Value::CreateTensor<int64_t>(
+                        memory_info,
+                        chunk_codes_data,
+                        chunk_code_count,
+                        scratch.chunk_shape.data(),
+                        scratch.chunk_shape.size()
+                    ));
                 break;
             case StatefulInputKind::PreConvHistory: {
                 float *data = state.pre_conv_history.data.empty()

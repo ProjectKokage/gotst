@@ -57,7 +57,9 @@ Because of that, the requested `text -> TTS -> ASR` verification could not be ex
   - `GotstSpeechRuntime::build_voice_design_language_input`
   - `GotstSpeechRuntime::load_tts_code_generator`
   - `GotstSpeechRuntime::generate_tts_codes`
-  - `GotstSpeechRuntime::generate_tts_codes_streaming`
+  - `GotstSpeechRuntime::start_tts_waveform_stream`
+  - `GotstSpeechRuntime::poll_tts_waveform_stream`
+  - `GotstSpeechRuntime::cancel_tts_waveform_stream`
 - Waveform post-processing helper:
   - `GotstSpeechRuntime::convert_decoder_output_to_waveform`
 

@@ -17,10 +17,15 @@
 #include <godot_cpp/variant/packed_int64_array.hpp>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <thread>
+#include <vector>
 
 namespace godot {
 
@@ -210,9 +215,6 @@ public:
     bool load_tts_code_generator(const Dictionary &config);
     bool is_tts_code_generator_loaded() const;
     Dictionary generate_tts_codes(const Dictionary &params);
-    Dictionary generate_tts_codes_streaming(const Dictionary &params, int64_t request_id, int64_t chunk_frames);
-    Array poll_tts_stream();
-    void cancel_tts_stream();
     Dictionary start_tts_waveform_stream(const Dictionary &params, int64_t request_id, int64_t chunk_frames);
     Array poll_tts_waveform_stream();
     void cancel_tts_waveform_stream(int64_t request_id);
@@ -244,28 +246,16 @@ private:
     std::unique_ptr<gotst::TenVad> ten_vad_;
     std::map<std::string, std::vector<int64_t>> custom_voice_speakers_;
 
-    struct StreamEvent {
-        int64_t request_id = 0;
-        PackedInt64Array codes;
-        int32_t frame_count = 0;
-        int32_t codes_per_frame = 0;
-        bool is_final = false;
-        bool is_error = false;
-        String error_message;
-    };
-
-    std::mutex stream_mutex_;
-    std::queue<StreamEvent> stream_queue_;
-    std::atomic<bool> stream_active_{false};
-    gotst::CancellationToken stream_cancel_;
-
     struct WaveformStreamEvent {
         int64_t request_id = 0;
         PackedFloat32Array waveform;
         int32_t sample_rate = 0;
         int32_t frame_count = 0;
         int32_t code_count = 0;
+        int32_t chunk_index = 0;
+        int32_t chunk_samples = 0;
         bool is_final = false;
+        bool is_stats = false;
         bool is_error = false;
         String error_message;
         int64_t elapsed_ms = 0;
@@ -274,12 +264,64 @@ private:
         int64_t decoder_inference_ms = 0;
         int64_t decoder_postprocess_ms = 0;
         int64_t queue_wait_ms = 0;
+        int64_t pipeline_queue_wait_ms = 0;
+        int64_t native_pack_ms = 0;
+        int64_t talker_prefill_ms = 0;
+        int64_t talker_decode_ms = 0;
+        int64_t predictor_ms = 0;
+        int64_t onnx_embedding_ms = 0;
+        int64_t codegen_other_ms = 0;
+    };
+
+    struct WaveformStreamRequest {
+        int64_t request_id = 0;
+        std::vector<float> initial_input;
+        int32_t initial_length = 0;
+        std::vector<float> trailing_hidden;
+        int32_t trailing_length = 0;
+        std::vector<float> pad_embedding;
+        gotst::TtsSamplingConfig sampling;
+        int32_t chunk_frames = 0;
+        std::chrono::steady_clock::time_point queued_at;
+        std::shared_ptr<gotst::CancellationToken> cancel;
+    };
+
+    struct WaveformDecodeJob {
+        int64_t request_id = 0;
+        std::shared_ptr<gotst::TtsWaveformDecoderStream> decoder_stream;
+        std::shared_ptr<gotst::CancellationToken> cancel;
+        std::vector<int64_t> codes;
+        int32_t frame_count = 0;
+        int32_t codes_per_frame = 0;
+        int32_t chunk_index = 0;
+        bool is_final = false;
+        double codegen_ms = 0.0;
+        double pipeline_queue_wait_ms = 0.0;
+        std::chrono::steady_clock::time_point stream_start;
+        std::chrono::steady_clock::time_point queued_at;
     };
 
     std::mutex waveform_stream_mutex_;
     std::queue<WaveformStreamEvent> waveform_stream_queue_;
     std::atomic<bool> waveform_stream_active_{false};
-    gotst::CancellationToken waveform_stream_cancel_;
+    std::mutex waveform_request_mutex_;
+    std::condition_variable waveform_request_cv_;
+    std::deque<WaveformStreamRequest> waveform_request_queue_;
+    std::mutex waveform_decode_mutex_;
+    std::condition_variable waveform_decode_cv_;
+    std::deque<WaveformDecodeJob> waveform_decode_queue_;
+    std::thread waveform_generation_worker_;
+    std::thread waveform_decoder_worker_;
+    std::atomic<bool> waveform_workers_stop_{false};
+    int64_t waveform_active_request_id_ = 0;
+    std::shared_ptr<gotst::CancellationToken> waveform_active_cancel_;
+
+    void ensure_waveform_stream_workers_started();
+    void stop_waveform_stream_workers();
+    void waveform_generation_worker_main();
+    void waveform_decoder_worker_main();
+    void push_waveform_event(WaveformStreamEvent event);
+    void clear_waveform_events();
 };
 
 } // namespace godot
