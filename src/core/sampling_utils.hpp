@@ -189,10 +189,7 @@ inline SampledToken sample_token(const float *logits,
         );
     }
 
-    scratch.candidates.clear();
-    if(scratch.candidates.capacity() < static_cast<size_t>(count)) {
-        scratch.candidates.reserve(static_cast<size_t>(count));
-    }
+    scratch.candidates.resize(static_cast<size_t>(count));
 
     for(int32_t index = 0; index < count; ++index) {
         const int64_t token_index = start + index;
@@ -200,7 +197,7 @@ inline SampledToken sample_token(const float *logits,
         if(has_prior_token(token_index) && repetition_penalty > 1.0f) {
             value = value >= 0.0 ? value / repetition_penalty : value * repetition_penalty;
         }
-        scratch.candidates.push_back({token_index, value / temp});
+        scratch.candidates[static_cast<size_t>(index)] = {token_index, value / temp};
     }
 
     auto by_value_desc = [](const SamplingCandidate &a, const SamplingCandidate &b) {
