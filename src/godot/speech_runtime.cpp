@@ -127,6 +127,125 @@ std::vector<float> copy_float_vector(const PackedFloat32Array &values) {
     return copied;
 }
 
+std::vector<int64_t> copy_int64_vector(const PackedInt64Array &values) {
+    std::vector<int64_t> copied(static_cast<size_t>(values.size()));
+    if(values.size() > 0) {
+        std::memcpy(copied.data(), values.ptr(), static_cast<size_t>(values.size()) * sizeof(int64_t));
+    }
+    return copied;
+}
+
+std::vector<uint8_t> copy_bool_vector_from_int64(const PackedInt64Array &values) {
+    std::vector<uint8_t> copied(static_cast<size_t>(values.size()));
+    for(int64_t index = 0; index < values.size(); ++index) {
+        copied[static_cast<size_t>(index)] = values[index] != 0 ? uint8_t{1} : uint8_t{0};
+    }
+    return copied;
+}
+
+std::vector<int64_t> dictionary_int64_array(const Dictionary &dict, const char *key) {
+    const Variant value = dict.get(key, PackedInt64Array());
+    if(value.get_type() == Variant::PACKED_INT64_ARRAY) {
+        return copy_int64_vector(static_cast<PackedInt64Array>(value));
+    }
+    if(value.get_type() == Variant::ARRAY) {
+        const Array array = static_cast<Array>(value);
+        std::vector<int64_t> copied;
+        copied.reserve(static_cast<size_t>(array.size()));
+        for(int64_t index = 0; index < array.size(); ++index) {
+            copied.push_back(static_cast<int64_t>(array[index]));
+        }
+        return copied;
+    }
+    return {};
+}
+
+std::vector<int32_t> dictionary_int32_array(const Dictionary &dict, const char *key) {
+    const Variant value = dict.get(key, PackedInt32Array());
+    if(value.get_type() == Variant::PACKED_INT32_ARRAY) {
+        const PackedInt32Array packed = static_cast<PackedInt32Array>(value);
+        std::vector<int32_t> copied(static_cast<size_t>(packed.size()));
+        if(packed.size() > 0) {
+            std::memcpy(copied.data(), packed.ptr(), static_cast<size_t>(packed.size()) * sizeof(int32_t));
+        }
+        return copied;
+    }
+    if(value.get_type() == Variant::PACKED_INT64_ARRAY) {
+        const PackedInt64Array packed = static_cast<PackedInt64Array>(value);
+        std::vector<int32_t> copied;
+        copied.reserve(static_cast<size_t>(packed.size()));
+        for(int64_t index = 0; index < packed.size(); ++index) {
+            copied.push_back(static_cast<int32_t>(packed[index]));
+        }
+        return copied;
+    }
+    if(value.get_type() == Variant::ARRAY) {
+        const Array array = static_cast<Array>(value);
+        std::vector<int32_t> copied;
+        copied.reserve(static_cast<size_t>(array.size()));
+        for(int64_t index = 0; index < array.size(); ++index) {
+            copied.push_back(static_cast<int32_t>(array[index]));
+        }
+        return copied;
+    }
+    return {};
+}
+
+std::vector<std::string> dictionary_string_array(const Dictionary &dict, const char *key) {
+    const Variant value = dict.get(key, Array());
+    std::vector<std::string> copied;
+    if(value.get_type() == Variant::PACKED_STRING_ARRAY) {
+        const PackedStringArray packed = static_cast<PackedStringArray>(value);
+        copied.reserve(static_cast<size_t>(packed.size()));
+        for(int64_t index = 0; index < packed.size(); ++index) {
+            copied.emplace_back(String(packed[index]).utf8().get_data());
+        }
+        return copied;
+    }
+    if(value.get_type() == Variant::ARRAY) {
+        const Array array = static_cast<Array>(value);
+        copied.reserve(static_cast<size_t>(array.size()));
+        for(int64_t index = 0; index < array.size(); ++index) {
+            copied.emplace_back(String(array[index]).utf8().get_data());
+        }
+    }
+    return copied;
+}
+
+std::vector<uint8_t> dictionary_bool_array(const Dictionary &dict, const char *key) {
+    const Variant value = dict.get(key, PackedInt64Array());
+    if(value.get_type() == Variant::PACKED_INT64_ARRAY) {
+        return copy_bool_vector_from_int64(static_cast<PackedInt64Array>(value));
+    }
+    if(value.get_type() == Variant::ARRAY) {
+        const Array array = static_cast<Array>(value);
+        std::vector<uint8_t> copied;
+        copied.reserve(static_cast<size_t>(array.size()));
+        for(int64_t index = 0; index < array.size(); ++index) {
+            copied.push_back(static_cast<bool>(array[index]) ? uint8_t{1} : uint8_t{0});
+        }
+        return copied;
+    }
+    return {};
+}
+
+std::vector<float> dictionary_float_array(const Dictionary &dict, const char *key) {
+    const Variant value = dict.get(key, PackedFloat32Array());
+    if(value.get_type() == Variant::PACKED_FLOAT32_ARRAY) {
+        return copy_float_vector(static_cast<PackedFloat32Array>(value));
+    }
+    if(value.get_type() == Variant::ARRAY) {
+        const Array array = static_cast<Array>(value);
+        std::vector<float> copied;
+        copied.reserve(static_cast<size_t>(array.size()));
+        for(int64_t index = 0; index < array.size(); ++index) {
+            copied.push_back(static_cast<float>(array[index]));
+        }
+        return copied;
+    }
+    return {};
+}
+
 gotst::TtsSamplingConfig tts_sampling_from_params(const Dictionary &params) {
     gotst::TtsSamplingConfig sampling;
     sampling.codebook_size = static_cast<int32_t>(params.get("codebook_size", 2048));
@@ -168,9 +287,364 @@ Dictionary pack_tts_prompt_result(const gotst::TtsPromptAssemblyResult &result) 
     return payload;
 }
 
+std::string dictionary_string(const Dictionary &dict, const char *key, const char *fallback = "") {
+    return String(dict.get(key, fallback)).utf8().get_data();
+}
+
+bool dictionary_bool(const Dictionary &dict, const char *key, bool fallback = false) {
+    return static_cast<bool>(dict.get(key, fallback));
+}
+
+int32_t dictionary_i32(const Dictionary &dict, const char *key, int32_t fallback = 0) {
+    return static_cast<int32_t>(dict.get(key, fallback));
+}
+
+int64_t dictionary_i64(const Dictionary &dict, const char *key, int64_t fallback = 0) {
+    return static_cast<int64_t>(dict.get(key, fallback));
+}
+
+float dictionary_f32(const Dictionary &dict, const char *key, float fallback = 0.0f) {
+    return static_cast<float>(dict.get(key, fallback));
+}
+
+std::string irodori_artifact_path(const Dictionary &config, const Dictionary &artifacts, const char *key) {
+    if(artifacts.has(key)) {
+        return dictionary_string(artifacts, key, "");
+    }
+    return dictionary_string(config, key, "");
+}
+
+std::map<std::string, std::string> dictionary_string_map(const Dictionary &dict) {
+    std::map<std::string, std::string> output;
+    const Array keys = dict.keys();
+    for(int64_t index = 0; index < keys.size(); ++index) {
+        const String key = keys[index];
+        output[std::string(key.utf8().get_data())] =
+            dictionary_string(dict, key.utf8().get_data(), "");
+    }
+    return output;
+}
+
+Dictionary nested_dictionary(const Dictionary &dict, const char *key) {
+    const Variant value = dict.get(key, Dictionary());
+    return value.get_type() == Variant::DICTIONARY ? static_cast<Dictionary>(value) : Dictionary();
+}
+
+gotst::IrodoriTtsProviderRoute irodori_provider_route_from_dictionary(
+    const Dictionary &config,
+    const Dictionary &routes,
+    const char *stage
+) {
+    gotst::IrodoriTtsProviderRoute route;
+    if(routes.has(stage)) {
+        const Variant route_value = routes[stage];
+        if(route_value.get_type() == Variant::DICTIONARY) {
+            const Dictionary route_dict = static_cast<Dictionary>(route_value);
+            route.provider_requested = dictionary_string(route_dict, "provider_requested", "");
+            route.provider = dictionary_string(route_dict, "provider", "");
+        }
+    }
+
+    const std::string prefix(stage);
+    const std::string requested_key = prefix + "_provider_requested";
+    const std::string provider_key = prefix + "_provider";
+    if(config.has(requested_key.c_str())) {
+        route.provider_requested = dictionary_string(config, requested_key.c_str(), route.provider_requested.c_str());
+    }
+    if(config.has(provider_key.c_str())) {
+        route.provider = dictionary_string(config, provider_key.c_str(), route.provider.c_str());
+    }
+    return route;
+}
+
+gotst::IrodoriTtsSessionConfig irodori_config_from_dictionary(const Dictionary &config) {
+    gotst::IrodoriTtsSessionConfig session_config;
+    session_config.bundle_root = dictionary_string(config, "bundle_root", "");
+    session_config.manifest_path = dictionary_string(config, "manifest_path", "");
+    session_config.mode = gotst::parse_irodori_tts_mode(dictionary_string(config, "mode", ""));
+    session_config.provider_profile = dictionary_string(config, "provider_profile", "cpu");
+    session_config.provider_requested = dictionary_string(config, "provider_requested", "CPU");
+    session_config.provider = dictionary_string(config, "provider", "CPU");
+    session_config.strict_provider = dictionary_bool(config, "strict_provider", false);
+    session_config.intra_op_threads = dictionary_i32(config, "intra_op_threads", 0);
+    session_config.inter_op_threads = dictionary_i32(config, "inter_op_threads", 0);
+    session_config.device_id = dictionary_i32(config, "device_id", 0);
+    session_config.optimization_level = dictionary_i32(config, "optimization_level", 99);
+    session_config.optimized_model_path = dictionary_string(config, "optimized_model_path", "");
+    const Dictionary provider_options = config.has("provider_options") ?
+        nested_dictionary(config, "provider_options") : nested_dictionary(config, "coreml_provider_options");
+    session_config.provider_options = dictionary_string_map(provider_options);
+    session_config.session_options = dictionary_string_map(nested_dictionary(config, "session_options"));
+    session_config.ort_enable_profiling = dictionary_bool(config, "ort_enable_profiling", false);
+    session_config.ort_profiling_prefix = dictionary_string(config, "ort_profiling_prefix", "");
+    session_config.ort_log_severity_level = dictionary_i32(config, "ort_log_severity_level", -1);
+    session_config.runtime_dispatch = dictionary_string(config, "runtime_dispatch", "force_cpu");
+    session_config.rf_execution_mode = dictionary_string(config, "rf_execution_mode", "auto");
+    session_config.dispatch_recommendation_path = dictionary_string(config, "dispatch_recommendation_path", "");
+    session_config.print_provider_diagnostics = dictionary_bool(config, "print_provider_diagnostics", false);
+    session_config.sample_rate = dictionary_i32(config, "sample_rate", 48000);
+    session_config.latent_dim = dictionary_i32(config, "latent_dim", 32);
+    session_config.latent_patch_size = dictionary_i32(config, "latent_patch_size", 1);
+    session_config.speaker_patch_size = dictionary_i32(config, "speaker_patch_size", 1);
+    session_config.codec_hop_length = dictionary_i32(config, "codec_hop_length", 640);
+    session_config.duration_aux_dim = dictionary_i32(config, "duration_aux_dim", 14);
+    session_config.max_text_tokens = dictionary_i32(config, "max_text_tokens", 256);
+    session_config.max_caption_tokens = dictionary_i32(config, "max_caption_tokens", 512);
+    session_config.max_ref_seconds = dictionary_i32(config, "max_ref_seconds", 30);
+    session_config.default_num_steps = dictionary_i32(config, "default_num_steps", 8);
+    session_config.default_t_schedule_mode = dictionary_string(config, "default_t_schedule_mode", "sway");
+    session_config.default_sway_coeff = dictionary_f32(config, "default_sway_coeff", -1.0f);
+    session_config.default_cfg_guidance_mode = dictionary_string(config, "default_cfg_guidance_mode", "");
+    session_config.require_all_artifacts = dictionary_bool(config, "require_all_artifacts", true);
+    session_config.enable_context_kv_cache = dictionary_bool(config, "enable_context_kv_cache", true);
+    session_config.enable_ref_latent_cache = dictionary_bool(config, "enable_ref_latent_cache", true);
+    session_config.enable_coreml_unrolled_rf_sampler =
+        dictionary_bool(config, "enable_coreml_unrolled_rf_sampler", false);
+
+    const Variant artifacts_value = config.get("artifacts", Dictionary());
+    const Dictionary artifacts = artifacts_value.get_type() == Variant::DICTIONARY ?
+        static_cast<Dictionary>(artifacts_value) : Dictionary();
+    session_config.artifacts.tokenizer_json_path = irodori_artifact_path(config, artifacts, "tokenizer_json_path");
+    session_config.artifacts.tokenizer_config_path = irodori_artifact_path(config, artifacts, "tokenizer_config_path");
+    session_config.artifacts.model_config_json_path = irodori_artifact_path(config, artifacts, "model_config_json_path");
+    session_config.artifacts.text_encoder_onnx_path = irodori_artifact_path(config, artifacts, "text_encoder_onnx_path");
+    session_config.artifacts.caption_encoder_onnx_path = irodori_artifact_path(config, artifacts, "caption_encoder_onnx_path");
+    session_config.artifacts.speaker_encoder_onnx_path = irodori_artifact_path(config, artifacts, "speaker_encoder_onnx_path");
+    session_config.artifacts.duration_predictor_onnx_path = irodori_artifact_path(config, artifacts, "duration_predictor_onnx_path");
+    session_config.artifacts.dit_step_onnx_path = irodori_artifact_path(config, artifacts, "dit_step_onnx_path");
+    session_config.artifacts.dacvae_encoder_onnx_path = irodori_artifact_path(config, artifacts, "dacvae_encoder_onnx_path");
+    session_config.artifacts.dacvae_decoder_onnx_path = irodori_artifact_path(config, artifacts, "dacvae_decoder_onnx_path");
+
+    const Dictionary routes = nested_dictionary(config, "provider_routes");
+    session_config.provider_routes.text_encoder = irodori_provider_route_from_dictionary(config, routes, "text_encoder");
+    session_config.provider_routes.caption_encoder = irodori_provider_route_from_dictionary(config, routes, "caption_encoder");
+    session_config.provider_routes.speaker_encoder = irodori_provider_route_from_dictionary(config, routes, "speaker_encoder");
+    session_config.provider_routes.duration_predictor = irodori_provider_route_from_dictionary(config, routes, "duration_predictor");
+    session_config.provider_routes.dit_step = irodori_provider_route_from_dictionary(config, routes, "dit_step");
+    session_config.provider_routes.dacvae_encoder = irodori_provider_route_from_dictionary(config, routes, "dacvae_encoder");
+    session_config.provider_routes.dacvae_decoder = irodori_provider_route_from_dictionary(config, routes, "dacvae_decoder");
+
+    const Variant buckets_value = config.get("buckets", Array());
+    if(buckets_value.get_type() == Variant::ARRAY) {
+        const Array buckets = static_cast<Array>(buckets_value);
+        for(int64_t index = 0; index < buckets.size(); ++index) {
+            const Variant bucket_value = buckets[index];
+            if(bucket_value.get_type() != Variant::DICTIONARY) {
+                continue;
+            }
+            const Dictionary bucket_dict = static_cast<Dictionary>(bucket_value);
+            gotst::IrodoriTtsBucket bucket;
+            bucket.latent_steps = dictionary_i32(bucket_dict, "latent_steps", 0);
+            bucket.text_tokens = dictionary_i32(bucket_dict, "text_tokens", 0);
+            bucket.caption_tokens = dictionary_i32(bucket_dict, "caption_tokens", 0);
+            bucket.ref_steps = dictionary_i32(bucket_dict, "ref_steps", 0);
+            if(bucket.latent_steps > 0 && bucket.text_tokens > 0) {
+                session_config.buckets.push_back(bucket);
+            }
+        }
+    }
+
+    const Array static_values = config.has("coreml_static_artifacts") ?
+        static_cast<Array>(config.get("coreml_static_artifacts", Array())) : Array();
+    for(int64_t index = 0; index < static_values.size(); ++index) {
+        const Variant artifact_value = static_values[index];
+        if(artifact_value.get_type() != Variant::DICTIONARY) {
+            continue;
+        }
+        const Dictionary artifact_dict = static_cast<Dictionary>(artifact_value);
+        gotst::IrodoriTtsStaticArtifact artifact;
+        artifact.bucket.latent_steps = dictionary_i32(artifact_dict, "latent_steps", 0);
+        artifact.bucket.text_tokens = dictionary_i32(artifact_dict, "text_tokens", 0);
+        artifact.bucket.caption_tokens = dictionary_i32(artifact_dict, "caption_tokens", 0);
+        artifact.bucket.ref_steps = dictionary_i32(artifact_dict, "ref_steps", 0);
+        artifact.dit_step_onnx_path = dictionary_string(artifact_dict, "dit_step_onnx_path", "");
+        artifact.dacvae_decoder_onnx_path = dictionary_string(artifact_dict, "dacvae_decoder_onnx_path", "");
+        artifact.rf_sampler_6_step_onnx_path = dictionary_string(artifact_dict, "rf_sampler_6_step_onnx_path", "");
+        artifact.rf_sampler_8_step_onnx_path = dictionary_string(artifact_dict, "rf_sampler_8_step_onnx_path", "");
+        if(artifact.bucket.latent_steps > 0 && artifact.bucket.text_tokens > 0 &&
+           !artifact.dit_step_onnx_path.empty()) {
+            session_config.coreml_static_artifacts.push_back(artifact);
+        }
+    }
+
+    return session_config;
+}
+
+gotst::IrodoriTtsRequest irodori_request_from_dictionary(const Dictionary &params) {
+    gotst::IrodoriTtsRequest request;
+    request.text = dictionary_string(params, "text", "");
+    request.caption = dictionary_string(params, "caption", "");
+    request.text_token_ids = dictionary_int64_array(params, "text_token_ids");
+    request.text_token_mask = dictionary_bool_array(params, "text_token_mask");
+    request.caption_token_ids = dictionary_int64_array(params, "caption_token_ids");
+    request.caption_token_mask = dictionary_bool_array(params, "caption_token_mask");
+    request.ref_wav_path = dictionary_string(params, "ref_wav_path", "");
+    request.ref_latent_path = dictionary_string(params, "ref_latent_path", "");
+    request.ref_latent = dictionary_float_array(params, "ref_latent");
+    request.ref_latent_steps = dictionary_i32(params, "ref_latent_steps", 0);
+    request.no_ref = dictionary_bool(params, "no_ref", false);
+    request.seed = dictionary_i64(params, "seed", -1);
+    request.num_steps = dictionary_i32(params, "num_steps", 8);
+    request.duration_scale = dictionary_f32(params, "duration_scale", 1.0f);
+    if(params.has("seconds")) {
+        request.seconds = dictionary_f32(params, "seconds", 0.0f);
+    }
+    request.cfg_scale_text = dictionary_f32(params, "cfg_scale_text", 3.0f);
+    request.cfg_scale_caption = dictionary_f32(params, "cfg_scale_caption", 3.0f);
+    request.cfg_scale_speaker = dictionary_f32(params, "cfg_scale_speaker", 5.0f);
+    if(params.has("cfg_scale")) {
+        request.cfg_scale = dictionary_f32(params, "cfg_scale", 0.0f);
+    }
+    request.cfg_min_t = dictionary_f32(params, "cfg_min_t", 0.5f);
+    request.cfg_max_t = dictionary_f32(params, "cfg_max_t", 1.0f);
+    request.cfg_guidance_mode = dictionary_string(params, "cfg_guidance_mode", "");
+    request.t_schedule_mode = dictionary_string(params, "t_schedule_mode", "sway");
+    request.sway_coeff = dictionary_f32(params, "sway_coeff", -1.0f);
+    request.context_kv_cache = dictionary_bool(params, "context_kv_cache", true);
+    request.ref_latent_cache = dictionary_bool(params, "ref_latent_cache", true);
+    request.decode_mode = dictionary_string(params, "decode_mode", "sequential");
+    return request;
+}
+
+std::string dictionary_path_alias(
+    const Dictionary &dict,
+    const char *primary,
+    const char *fallback
+) {
+    const std::string value = dictionary_string(dict, primary, "");
+    if(!value.empty()) {
+        return value;
+    }
+    return dictionary_string(dict, fallback, "");
+}
+
+gotst::Qwen3ForcedAlignerModelPaths forced_aligner_paths_from_dictionary(const Dictionary &config) {
+    gotst::Qwen3ForcedAlignerModelPaths paths;
+    paths.audio_conv_onnx_path = dictionary_path_alias(
+        config,
+        "audio_conv_onnx_path",
+        "thinker_audio_conv_path"
+    );
+    paths.audio_encoder_onnx_path = dictionary_path_alias(
+        config,
+        "audio_encoder_onnx_path",
+        "thinker_audio_encoder_path"
+    );
+    paths.embedding_onnx_path = dictionary_path_alias(
+        config,
+        "embedding_onnx_path",
+        "thinker_embedding_path"
+    );
+    paths.backbone_gguf_path = dictionary_path_alias(
+        config,
+        "backbone_gguf_path",
+        "thinker_gguf_path"
+    );
+    paths.classifier_head_path = dictionary_string(config, "classifier_head_path", "");
+    return paths;
+}
+
+gotst::Qwen3ForcedAlignerSessionConfig forced_aligner_config_from_dictionary(const Dictionary &config) {
+    gotst::Qwen3ForcedAlignerSessionConfig session_config;
+    session_config.sample_rate = dictionary_i32(config, "sample_rate", 16000);
+    session_config.mel_bins = dictionary_i32(config, "mel_bins", 128);
+    session_config.fft_size = dictionary_i32(config, "fft_size", 400);
+    session_config.hop_length = dictionary_i32(config, "hop_length", 160);
+    session_config.chunk_length_seconds = static_cast<double>(config.get("chunk_length_seconds", 300.0));
+    session_config.audio_conv_chunk_frames = dictionary_i32(config, "audio_conv_chunk_frames", 100);
+    session_config.timestamp_token_id = dictionary_i32(config, "timestamp_token_id", 151705);
+    session_config.timestamp_segment_ms = dictionary_i32(config, "timestamp_segment_ms", 80);
+    session_config.classify_num = dictionary_i32(config, "classify_num", 5000);
+    session_config.n_ctx = dictionary_i32(config, "n_ctx", 8192);
+    session_config.n_batch = dictionary_i32(config, "n_batch", 1024);
+    session_config.n_threads = dictionary_i32(config, "n_threads", -1);
+    session_config.n_gpu_layers = dictionary_i32(config, "n_gpu_layers", 0);
+    session_config.use_mmap = dictionary_bool(config, "use_mmap", true);
+    session_config.use_mlock = dictionary_bool(config, "use_mlock", false);
+    session_config.flash_attn_type = dictionary_i32(config, "flash_attn_type", -1);
+    session_config.type_k = dictionary_i32(config, "type_k", -1);
+    session_config.type_v = dictionary_i32(config, "type_v", -1);
+    session_config.position_components = dictionary_i32(config, "position_components", 3);
+    session_config.onnx_provider = dictionary_string(config, "onnx_provider", "CPU");
+    if(session_config.onnx_provider == "CPU" && config.has("provider")) {
+        session_config.onnx_provider = dictionary_string(config, "provider", "CPU");
+    }
+    session_config.onnx_device_id = dictionary_i32(config, "onnx_device_id", 0);
+    session_config.onnx_intra_op_threads = dictionary_i32(config, "onnx_intra_op_threads", 0);
+    session_config.onnx_inter_op_threads = dictionary_i32(config, "onnx_inter_op_threads", 0);
+    session_config.onnx_optimization_level = dictionary_i32(config, "onnx_optimization_level", 99);
+    return session_config;
+}
+
+gotst::Qwen3ForcedAlignmentRequest forced_alignment_request_from_dictionary(const Dictionary &params) {
+    gotst::Qwen3ForcedAlignmentRequest request;
+    request.waveform = dictionary_float_array(params, "waveform");
+    request.input_sample_rate = dictionary_i32(params, "input_sample_rate", 0);
+    request.language = dictionary_string(params, "language", "");
+    request.text_units = dictionary_string_array(params, "text_units");
+    if(request.text_units.empty() && params.has("text")) {
+        request.text_units = gotst::split_forced_alignment_units(
+            dictionary_string(params, "text", ""),
+            dictionary_string(params, "unit_mode", request.language.c_str())
+        );
+    }
+    request.token_ids = dictionary_int64_array(params, "token_ids");
+    request.timestamp_token_indices = dictionary_int32_array(params, "timestamp_token_indices");
+    request.audio_placeholder_start = dictionary_i32(params, "audio_placeholder_start", -1);
+    request.audio_placeholder_count = dictionary_i32(params, "audio_placeholder_count", 0);
+    request.allow_audio_truncation = dictionary_bool(params, "allow_audio_truncation", false);
+    request.max_duration_seconds = static_cast<double>(params.get("max_duration_seconds", 300.0));
+    return request;
+}
+
+Array pack_forced_alignment_spans(const std::vector<gotst::Qwen3ForcedAlignmentSpan> &spans) {
+    Array output;
+    for(const gotst::Qwen3ForcedAlignmentSpan &span : spans) {
+        Dictionary item;
+        item["text"] = String(span.text.c_str());
+        item["start_sec"] = span.start_sec;
+        item["end_sec"] = span.end_sec;
+        item["start_bin"] = span.start_bin;
+        item["end_bin"] = span.end_bin;
+        item["confidence"] = span.confidence;
+        output.push_back(item);
+    }
+    return output;
+}
+
+Dictionary forced_alignment_timings_to_dictionary(const gotst::Qwen3ForcedAlignmentResult &result) {
+    Dictionary timings;
+    timings["elapsed_ms"] = round_ms(result.elapsed_ms);
+    timings["frontend_ms"] = round_ms(result.frontend_ms);
+    timings["audio_conv_ms"] = round_ms(result.audio_conv_ms);
+    timings["audio_encoder_ms"] = round_ms(result.audio_encoder_ms);
+    timings["embedding_ms"] = round_ms(result.embedding_ms);
+    timings["backbone_ms"] = round_ms(result.backbone_ms);
+    timings["classifier_ms"] = round_ms(result.classifier_ms);
+    return timings;
+}
+
+Dictionary irodori_timings_to_dictionary(const std::map<std::string, double> &timings) {
+    Dictionary output;
+    for(const auto &[name, value] : timings) {
+        output[String(name.c_str())] = round_ms(value);
+    }
+    return output;
+}
+
+Dictionary string_map_to_dictionary(const std::map<std::string, std::string> &values) {
+    Dictionary output;
+    for(const auto &[key, value] : values) {
+        output[String(key.c_str())] = String(value.c_str());
+    }
+    return output;
+}
+
 } // namespace
 
 GotstSpeechRuntime::~GotstSpeechRuntime() {
+    stop_forced_alignment_worker();
+    stop_irodori_stream_worker();
     stop_waveform_stream_workers();
 
     // Keep the GGUF-backed speech decoders alive until process exit. On macOS
@@ -179,6 +653,7 @@ GotstSpeechRuntime::~GotstSpeechRuntime() {
     // native runtime after the useful work is already complete.
     (void)tts_code_generator_.release();
     (void)asr_token_decoder_.release();
+    (void)qwen3_forced_aligner_.release();
 }
 
 void GotstSpeechRuntime::_bind_methods() {
@@ -384,6 +859,26 @@ void GotstSpeechRuntime::_bind_methods() {
         &GotstSpeechRuntime::decode_tts_codes_to_waveform
     );
     ClassDB::bind_method(
+        D_METHOD("load_irodori_tts", "config"),
+        &GotstSpeechRuntime::load_irodori_tts
+    );
+    ClassDB::bind_method(
+        D_METHOD("is_irodori_tts_loaded"),
+        &GotstSpeechRuntime::is_irodori_tts_loaded
+    );
+    ClassDB::bind_method(
+        D_METHOD("start_irodori_tts_stream", "params", "request_id"),
+        &GotstSpeechRuntime::start_irodori_tts_stream
+    );
+    ClassDB::bind_method(
+        D_METHOD("poll_irodori_tts_stream"),
+        &GotstSpeechRuntime::poll_irodori_tts_stream
+    );
+    ClassDB::bind_method(
+        D_METHOD("cancel_irodori_tts_stream", "request_id"),
+        &GotstSpeechRuntime::cancel_irodori_tts_stream
+    );
+    ClassDB::bind_method(
         D_METHOD("load_asr_token_decoder", "config"),
         &GotstSpeechRuntime::load_asr_token_decoder
     );
@@ -394,6 +889,26 @@ void GotstSpeechRuntime::_bind_methods() {
     ClassDB::bind_method(
         D_METHOD("decode_asr_tokens", "params"),
         &GotstSpeechRuntime::decode_asr_tokens
+    );
+    ClassDB::bind_method(
+        D_METHOD("load_qwen3_forced_aligner", "config"),
+        &GotstSpeechRuntime::load_qwen3_forced_aligner
+    );
+    ClassDB::bind_method(
+        D_METHOD("is_qwen3_forced_aligner_loaded"),
+        &GotstSpeechRuntime::is_qwen3_forced_aligner_loaded
+    );
+    ClassDB::bind_method(
+        D_METHOD("start_qwen3_forced_alignment", "params", "request_id"),
+        &GotstSpeechRuntime::start_qwen3_forced_alignment
+    );
+    ClassDB::bind_method(
+        D_METHOD("poll_qwen3_forced_alignment"),
+        &GotstSpeechRuntime::poll_qwen3_forced_alignment
+    );
+    ClassDB::bind_method(
+        D_METHOD("cancel_qwen3_forced_alignment", "request_id"),
+        &GotstSpeechRuntime::cancel_qwen3_forced_alignment
     );
     ClassDB::bind_method(
         D_METHOD("load_ten_vad", "config"),
@@ -2251,6 +2766,189 @@ Dictionary GotstSpeechRuntime::decode_tts_codes_to_waveform(
     return output;
 }
 
+bool GotstSpeechRuntime::load_irodori_tts(const Dictionary &config) {
+    stop_irodori_stream_worker();
+
+    gotst::IrodoriTtsSessionConfig session_config = irodori_config_from_dictionary(config);
+    irodori_tts_session_ = std::make_unique<gotst::IrodoriTtsSession>();
+    auto result = irodori_tts_session_->load(session_config);
+    if(!result.is_ok()) {
+        ERR_PRINT(String("Irodori TTS load failed: ") + String(result.error_message().c_str()));
+        irodori_tts_session_.reset();
+        return false;
+    }
+
+    return true;
+}
+
+bool GotstSpeechRuntime::is_irodori_tts_loaded() const {
+    return irodori_tts_session_ && irodori_tts_session_->is_loaded();
+}
+
+void GotstSpeechRuntime::push_irodori_event(IrodoriStreamEvent event) {
+    std::lock_guard<std::mutex> lock(irodori_stream_mutex_);
+    irodori_stream_queue_.push(std::move(event));
+}
+
+void GotstSpeechRuntime::clear_irodori_events() {
+    std::lock_guard<std::mutex> lock(irodori_stream_mutex_);
+    while(!irodori_stream_queue_.empty()) {
+        irodori_stream_queue_.pop();
+    }
+}
+
+void GotstSpeechRuntime::stop_irodori_stream_worker() {
+    if(irodori_active_cancel_) {
+        irodori_active_cancel_->cancel();
+    }
+    if(irodori_worker_.joinable()) {
+        irodori_worker_.join();
+    }
+    irodori_stream_active_.store(false, std::memory_order_release);
+    irodori_active_request_id_ = 0;
+    irodori_active_cancel_.reset();
+    clear_irodori_events();
+}
+
+Dictionary GotstSpeechRuntime::start_irodori_tts_stream(const Dictionary &params, int64_t request_id) {
+    Dictionary output;
+    if(!irodori_tts_session_ || !irodori_tts_session_->is_loaded()) {
+        output["error"] = "Irodori TTS is not loaded.";
+        return output;
+    }
+    if(request_id <= 0) {
+        output["error"] = "Irodori TTS request_id must be positive.";
+        return output;
+    }
+    if(irodori_stream_active_.load(std::memory_order_acquire)) {
+        output["error"] = "Irodori TTS stream is already active.";
+        return output;
+    }
+    if(irodori_worker_.joinable()) {
+        irodori_worker_.join();
+    }
+
+    clear_irodori_events();
+    gotst::IrodoriTtsRequest request = irodori_request_from_dictionary(params);
+    auto cancel = std::make_shared<gotst::CancellationToken>();
+    irodori_active_request_id_ = request_id;
+    irodori_active_cancel_ = cancel;
+    irodori_stream_active_.store(true, std::memory_order_release);
+
+    irodori_worker_ = std::thread([this, request, request_id, cancel]() {
+        using Clock = std::chrono::steady_clock;
+        using Ms = std::chrono::duration<double, std::milli>;
+
+        const auto started = Clock::now();
+        IrodoriStreamEvent event;
+        event.request_id = request_id;
+        event.sample_rate = 48000;
+
+        if(!irodori_tts_session_) {
+            event.is_error = true;
+            event.error_message = "Irodori TTS session is not available.";
+            event.elapsed_ms = round_ms(Ms(Clock::now() - started).count());
+            push_irodori_event(std::move(event));
+            irodori_stream_active_.store(false, std::memory_order_release);
+            return;
+        }
+
+        auto result = irodori_tts_session_->synthesize(request, cancel.get());
+        event.elapsed_ms = round_ms(Ms(Clock::now() - started).count());
+        if(!result.is_ok()) {
+            const bool cancelled = cancel && cancel->is_cancelled();
+            event.is_cancelled = cancelled;
+            event.is_error = !cancelled;
+            event.error_message = String(result.error_message().c_str());
+            event.mode = String(gotst::irodori_tts_mode_name(irodori_tts_session_->config().mode).c_str());
+            event.provider_profile = String(irodori_tts_session_->config().provider_profile.c_str());
+            event.provider_requested = String(irodori_tts_session_->config().provider_requested.c_str());
+            event.provider_effective = String(irodori_tts_session_->config().provider.c_str());
+            push_irodori_event(std::move(event));
+            irodori_stream_active_.store(false, std::memory_order_release);
+            return;
+        }
+
+        const auto &synth = result.value();
+        event.waveform = pack_float_array(synth.waveform);
+        event.sample_rate = synth.sample_rate;
+        event.frame_count = synth.frame_count;
+        event.is_final = true;
+        event.mode = String(synth.mode.c_str());
+        event.selected_bucket = String(synth.selected_bucket.c_str());
+        event.selected_bucket_latent_steps = synth.selected_bucket_latent_steps;
+        event.provider_profile = String(synth.provider_profile.c_str());
+        event.provider_requested = String(synth.provider_requested.c_str());
+        event.provider_effective = String(synth.provider_effective.c_str());
+        event.provider_requested_by_stage = string_map_to_dictionary(synth.provider_requested_by_stage);
+        event.provider_effective_by_stage = string_map_to_dictionary(synth.provider_effective_by_stage);
+        event.cache_hit = synth.cache_hit;
+        event.timings_ms = irodori_timings_to_dictionary(synth.timings_ms);
+        event.instrumentation_ms = irodori_timings_to_dictionary(synth.instrumentation_ms);
+        event.diagnostics = string_map_to_dictionary(synth.diagnostics);
+        push_irodori_event(std::move(event));
+        irodori_stream_active_.store(false, std::memory_order_release);
+    });
+
+    output["started"] = true;
+    output["request_id"] = request_id;
+    return output;
+}
+
+Array GotstSpeechRuntime::poll_irodori_tts_stream() {
+    Array events;
+    {
+        std::lock_guard<std::mutex> lock(irodori_stream_mutex_);
+        while(!irodori_stream_queue_.empty()) {
+            IrodoriStreamEvent &ev = irodori_stream_queue_.front();
+            Dictionary d;
+            d["request_id"] = ev.request_id;
+            d["waveform"] = ev.waveform;
+            d["sample_rate"] = ev.sample_rate;
+            d["frame_count"] = ev.frame_count;
+            d["is_final"] = ev.is_final;
+            d["is_cancelled"] = ev.is_cancelled;
+            d["elapsed_ms"] = ev.elapsed_ms;
+            d["mode"] = ev.mode;
+            d["selected_bucket"] = ev.selected_bucket;
+            d["selected_bucket_latent_steps"] = ev.selected_bucket_latent_steps;
+            d["provider_profile"] = ev.provider_profile;
+            d["provider_requested"] = ev.provider_requested;
+            d["provider_effective"] = ev.provider_effective;
+            d["provider_requested_by_stage"] = ev.provider_requested_by_stage;
+            d["provider_effective_by_stage"] = ev.provider_effective_by_stage;
+            d["cache_hit"] = ev.cache_hit;
+            d["timings_ms"] = ev.timings_ms;
+            d["instrumentation_ms"] = ev.instrumentation_ms;
+            d["diagnostics"] = ev.diagnostics;
+            if(ev.is_error) {
+                d["error"] = ev.error_message;
+            }
+            if(ev.is_cancelled) {
+                d["cancelled"] = true;
+            }
+            events.push_back(d);
+            irodori_stream_queue_.pop();
+        }
+    }
+
+    if(!irodori_stream_active_.load(std::memory_order_acquire) && irodori_worker_.joinable()) {
+        irodori_worker_.join();
+        irodori_active_request_id_ = 0;
+        irodori_active_cancel_.reset();
+    }
+
+    return events;
+}
+
+void GotstSpeechRuntime::cancel_irodori_tts_stream(int64_t request_id) {
+    if(request_id <= 0 || irodori_active_request_id_ == request_id) {
+        if(irodori_active_cancel_) {
+            irodori_active_cancel_->cancel();
+        }
+    }
+}
+
 bool GotstSpeechRuntime::load_asr_token_decoder(const Dictionary &config) {
     gotst::AsrModelPaths paths;
     paths.thinker_gguf_path = String(config.get("thinker_gguf_path", "")).utf8().get_data();
@@ -2322,6 +3020,154 @@ Dictionary GotstSpeechRuntime::decode_asr_tokens(const Dictionary &params) {
     output["decode_ms"] = static_cast<int64_t>(std::llround(decoded.decode_ms));
     output["onnx_embedding_ms"] = static_cast<int64_t>(std::llround(decoded.onnx_embedding_ms));
     return output;
+}
+
+bool GotstSpeechRuntime::load_qwen3_forced_aligner(const Dictionary &config) {
+    gotst::Qwen3ForcedAlignerModelPaths paths = forced_aligner_paths_from_dictionary(config);
+    gotst::Qwen3ForcedAlignerSessionConfig session_config = forced_aligner_config_from_dictionary(config);
+
+    qwen3_forced_aligner_ = std::make_unique<gotst::Qwen3ForcedAligner>();
+    auto result = qwen3_forced_aligner_->load(paths, session_config);
+    if(!result.is_ok()) {
+        ERR_PRINT(String("Qwen3 forced-aligner load failed: ") + String(result.error_message().c_str()));
+        qwen3_forced_aligner_.reset();
+        return false;
+    }
+    return true;
+}
+
+bool GotstSpeechRuntime::is_qwen3_forced_aligner_loaded() const {
+    return qwen3_forced_aligner_ && qwen3_forced_aligner_->is_loaded();
+}
+
+void GotstSpeechRuntime::push_forced_alignment_event(ForcedAlignmentEvent event) {
+    std::lock_guard<std::mutex> lock(forced_alignment_mutex_);
+    forced_alignment_queue_.push(std::move(event));
+}
+
+void GotstSpeechRuntime::clear_forced_alignment_events() {
+    std::lock_guard<std::mutex> lock(forced_alignment_mutex_);
+    while(!forced_alignment_queue_.empty()) {
+        forced_alignment_queue_.pop();
+    }
+}
+
+void GotstSpeechRuntime::stop_forced_alignment_worker() {
+    if(forced_alignment_active_cancel_) {
+        forced_alignment_active_cancel_->cancel();
+    }
+    if(forced_alignment_worker_.joinable()) {
+        forced_alignment_worker_.join();
+    }
+    forced_alignment_active_.store(false, std::memory_order_release);
+    forced_alignment_active_request_id_ = 0;
+    forced_alignment_active_cancel_.reset();
+    clear_forced_alignment_events();
+}
+
+Dictionary GotstSpeechRuntime::start_qwen3_forced_alignment(const Dictionary &params, int64_t request_id) {
+    Dictionary output;
+    if(!qwen3_forced_aligner_ || !qwen3_forced_aligner_->is_loaded()) {
+        output["error"] = "Qwen3 forced aligner is not loaded.";
+        return output;
+    }
+    if(request_id <= 0) {
+        output["error"] = "Qwen3 forced alignment request_id must be positive.";
+        return output;
+    }
+    if(forced_alignment_active_.load(std::memory_order_acquire)) {
+        output["error"] = "Qwen3 forced alignment is already active.";
+        return output;
+    }
+    if(forced_alignment_worker_.joinable()) {
+        forced_alignment_worker_.join();
+    }
+    clear_forced_alignment_events();
+
+    gotst::Qwen3ForcedAlignmentRequest request = forced_alignment_request_from_dictionary(params);
+    auto validation = gotst::validate_qwen3_forced_alignment_request(
+        request,
+        qwen3_forced_aligner_->config()
+    );
+    if(!validation.is_ok()) {
+        output["error"] = String(validation.error_message().c_str());
+        return output;
+    }
+
+    auto cancel = std::make_shared<gotst::CancellationToken>();
+    forced_alignment_active_cancel_ = cancel;
+    forced_alignment_active_request_id_ = request_id;
+    forced_alignment_active_.store(true, std::memory_order_release);
+    forced_alignment_worker_ = std::thread([this, request_id, request = std::move(request), cancel]() mutable {
+        ForcedAlignmentEvent event;
+        event.request_id = request_id;
+        auto result = qwen3_forced_aligner_->align(request, cancel.get());
+        if(!result.is_ok()) {
+            if(result.error_code() == gotst::ErrorCode::Cancelled) {
+                event.is_cancelled = true;
+            } else {
+                event.is_error = true;
+                event.error_message = String(result.error_message().c_str());
+            }
+            push_forced_alignment_event(std::move(event));
+            forced_alignment_active_.store(false, std::memory_order_release);
+            return;
+        }
+
+        event.is_completed = true;
+        event.spans = pack_forced_alignment_spans(result.value().spans);
+        event.timings_ms = forced_alignment_timings_to_dictionary(result.value());
+        event.token_count = result.value().token_count;
+        event.audio_token_count = result.value().audio_token_count;
+        push_forced_alignment_event(std::move(event));
+        forced_alignment_active_.store(false, std::memory_order_release);
+    });
+
+    output["started"] = true;
+    output["request_id"] = request_id;
+    return output;
+}
+
+Array GotstSpeechRuntime::poll_qwen3_forced_alignment() {
+    Array events;
+    {
+        std::lock_guard<std::mutex> lock(forced_alignment_mutex_);
+        while(!forced_alignment_queue_.empty()) {
+            ForcedAlignmentEvent event = std::move(forced_alignment_queue_.front());
+            forced_alignment_queue_.pop();
+
+            Dictionary payload;
+            payload["request_id"] = event.request_id;
+            if(event.is_completed) {
+                payload["type"] = "completed";
+                payload["spans"] = event.spans;
+                payload["timings_ms"] = event.timings_ms;
+                payload["token_count"] = event.token_count;
+                payload["audio_token_count"] = event.audio_token_count;
+            } else if(event.is_cancelled) {
+                payload["type"] = "cancelled";
+            } else {
+                payload["type"] = "error";
+                payload["error"] = event.error_message;
+            }
+            events.push_back(payload);
+        }
+    }
+
+    if(!forced_alignment_active_.load(std::memory_order_acquire) && forced_alignment_worker_.joinable()) {
+        forced_alignment_worker_.join();
+        forced_alignment_active_request_id_ = 0;
+        forced_alignment_active_cancel_.reset();
+    }
+    return events;
+}
+
+void GotstSpeechRuntime::cancel_qwen3_forced_alignment(int64_t request_id) {
+    if(request_id <= 0 || forced_alignment_active_request_id_ == request_id) {
+        if(forced_alignment_active_cancel_) {
+            forced_alignment_active_cancel_->cancel();
+        }
+    }
 }
 
 bool GotstSpeechRuntime::load_ten_vad(const Dictionary &config) {

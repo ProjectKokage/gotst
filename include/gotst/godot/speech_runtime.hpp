@@ -4,7 +4,9 @@
 #include "gotst/core/speech_encoder_session.hpp"
 #include "gotst/core/tts_code_generator.hpp"
 #include "gotst/core/tts_waveform_decoder.hpp"
+#include "gotst/core/irodori_tts_session.hpp"
 #include "gotst/core/asr_token_decoder.hpp"
+#include "gotst/core/qwen3_forced_aligner.hpp"
 #include "gotst/core/ten_vad.hpp"
 #include "gotst/core/language_config.hpp"
 
@@ -222,9 +224,20 @@ public:
     bool is_tts_waveform_decoder_loaded() const;
     Dictionary decode_tts_codes_to_waveform(const PackedInt64Array &audio_codes, int64_t frame_count) const;
 
+    bool load_irodori_tts(const Dictionary &config);
+    bool is_irodori_tts_loaded() const;
+    Dictionary start_irodori_tts_stream(const Dictionary &params, int64_t request_id);
+    Array poll_irodori_tts_stream();
+    void cancel_irodori_tts_stream(int64_t request_id);
+
     bool load_asr_token_decoder(const Dictionary &config);
     bool is_asr_token_decoder_loaded() const;
     Dictionary decode_asr_tokens(const Dictionary &params);
+    bool load_qwen3_forced_aligner(const Dictionary &config);
+    bool is_qwen3_forced_aligner_loaded() const;
+    Dictionary start_qwen3_forced_alignment(const Dictionary &params, int64_t request_id);
+    Array poll_qwen3_forced_alignment();
+    void cancel_qwen3_forced_alignment(int64_t request_id);
     bool load_ten_vad(const Dictionary &config);
     bool is_ten_vad_loaded() const;
     void reset_ten_vad();
@@ -241,8 +254,10 @@ private:
     std::unique_ptr<gotst::SpeechTokenizerEncoderSession> speech_tokenizer_encoder_;
     std::unique_ptr<gotst::TtsCodeGenerator> tts_code_generator_;
     std::unique_ptr<gotst::TtsWaveformDecoder> tts_waveform_decoder_;
+    std::unique_ptr<gotst::IrodoriTtsSession> irodori_tts_session_;
     int32_t tts_waveform_decoder_sample_rate_ = 24000;
     std::unique_ptr<gotst::AsrTokenDecoder> asr_token_decoder_;
+    std::unique_ptr<gotst::Qwen3ForcedAligner> qwen3_forced_aligner_;
     std::unique_ptr<gotst::TenVad> ten_vad_;
     std::map<std::string, std::vector<int64_t>> custom_voice_speakers_;
 
@@ -320,12 +335,68 @@ private:
     int64_t waveform_active_request_id_ = 0;
     std::shared_ptr<gotst::CancellationToken> waveform_active_cancel_;
 
+    struct IrodoriStreamEvent {
+        int64_t request_id = 0;
+        PackedFloat32Array waveform;
+        int32_t sample_rate = 48000;
+        int32_t frame_count = 0;
+        bool is_final = false;
+        bool is_error = false;
+        bool is_cancelled = false;
+        String error_message;
+        int64_t elapsed_ms = 0;
+        String mode;
+        String selected_bucket;
+        int32_t selected_bucket_latent_steps = 0;
+        String provider_profile;
+        String provider_requested;
+        String provider_effective;
+        Dictionary provider_requested_by_stage;
+        Dictionary provider_effective_by_stage;
+        bool cache_hit = false;
+        Dictionary timings_ms;
+        Dictionary instrumentation_ms;
+        Dictionary diagnostics;
+    };
+
+    std::mutex irodori_stream_mutex_;
+    std::queue<IrodoriStreamEvent> irodori_stream_queue_;
+    std::thread irodori_worker_;
+    std::atomic<bool> irodori_stream_active_{false};
+    int64_t irodori_active_request_id_ = 0;
+    std::shared_ptr<gotst::CancellationToken> irodori_active_cancel_;
+
+    struct ForcedAlignmentEvent {
+        int64_t request_id = 0;
+        bool is_completed = false;
+        bool is_error = false;
+        bool is_cancelled = false;
+        String error_message;
+        Array spans;
+        Dictionary timings_ms;
+        int32_t token_count = 0;
+        int32_t audio_token_count = 0;
+    };
+
+    std::mutex forced_alignment_mutex_;
+    std::queue<ForcedAlignmentEvent> forced_alignment_queue_;
+    std::thread forced_alignment_worker_;
+    std::atomic<bool> forced_alignment_active_{false};
+    int64_t forced_alignment_active_request_id_ = 0;
+    std::shared_ptr<gotst::CancellationToken> forced_alignment_active_cancel_;
+
     void ensure_waveform_stream_workers_started();
     void stop_waveform_stream_workers();
     void waveform_generation_worker_main();
     void waveform_decoder_worker_main();
     void push_waveform_event(WaveformStreamEvent event);
     void clear_waveform_events();
+    void stop_irodori_stream_worker();
+    void push_irodori_event(IrodoriStreamEvent event);
+    void clear_irodori_events();
+    void stop_forced_alignment_worker();
+    void push_forced_alignment_event(ForcedAlignmentEvent event);
+    void clear_forced_alignment_events();
 };
 
 } // namespace godot
