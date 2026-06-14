@@ -44,27 +44,19 @@ This repository currently provides:
 
 ## Build
 
-Default local layout assumes sibling repositories:
+See [`docs/setup_build.md`](docs/setup_build.md) for standalone setup,
+GDExtension, native test, and CLI build instructions.
 
-- `/home/x17/code_repo/gotst`
-- `/home/x17/code_repo/godorama`
-- `/home/x17/code_repo/gonx`
-
-Configure and build:
+Quick Debug addon build with sibling `godorama` and `gonx` checkouts:
 
 ```bash
-cmake -S . -B build/dev -DCMAKE_BUILD_TYPE=Debug
-cmake --build build/dev --parallel
-ctest --test-dir build/dev --output-on-failure
-```
+cmake -S . -B build/debug -G Ninja \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DGOTST_BUILD_GDEXTENSION=ON \
+  -DGOTST_BUILD_TESTS=OFF \
+  -DGODOTCPP_TARGET=template_debug
 
-Override dependency locations if needed:
-
-```bash
-cmake -S . -B build/dev \
-  -DGOTST_GODORAMA_SOURCE_DIR=/path/to/godorama \
-  -DGOTST_GONX_SOURCE_DIR=/path/to/gonx \
-  -DGOTST_GODOT_CPP_SOURCE_DIR=/path/to/godot-cpp
+cmake --build build/debug --parallel
 ```
 
 ## Godot addon layout
@@ -77,8 +69,10 @@ This keeps the repo directly usable as an addon workspace.
 
 ## Current responsibility split
 
-- `project-kokage` still owns tokenizer loading, request lifecycle, and conversation orchestration.
-- `gotst` owns the numerically heavy speech kernels currently called from those adapters.
+- The consuming Godot project owns request lifecycle, conversation
+  orchestration, scene logic, UI, and audio playback policy.
+- `gotst` owns the speech-specific native kernels and runtime helpers exposed
+  through its Godot boundary.
 - `godorama` remains the generic GGUF bridge.
 - `gonx` remains the generic ONNX bridge.
 
