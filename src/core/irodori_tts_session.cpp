@@ -1,4 +1,5 @@
 #include "gotst/core/irodori_tts_session.hpp"
+#include "gotst/core/text_tokenization.hpp"
 
 #include <gonx/core/provider.hpp>
 #include <gonx/core/session.hpp>
@@ -148,6 +149,17 @@ void set_metric(std::map<std::string, double> *metrics, const std::string &name,
     }
 }
 
+void max_metric(std::map<std::string, double> *metrics, const std::string &name, double value) {
+    if(metrics) {
+        auto found = metrics->find(name);
+        if(found == metrics->end()) {
+            (*metrics)[name] = value;
+        } else {
+            found->second = std::max(found->second, value);
+        }
+    }
+}
+
 void add_diagnostic(
     std::map<std::string, std::string> *diagnostics,
     const std::string &name,
@@ -177,6 +189,14 @@ struct ConditionState {
 struct CachedConditionState {
     ConditionState conditions;
     int32_t ref_steps = 0;
+};
+
+struct RfBatchWorkspace {
+    FloatTensor x_t_batch;
+    FloatTensor t_batch;
+    BoolTensor latent_mask_batch;
+    ConditionState conditions_batch;
+    std::vector<const ConditionState *> condition_refs;
 };
 
 std::string shape_to_string(std::span<const int64_t> shape) {
@@ -484,6 +504,18 @@ std::string build_condition_cache_key_internal(
     return stream.str();
 }
 
+bool is_ascii_blank(std::string_view text) {
+    return std::all_of(text.begin(), text.end(), [](unsigned char ch) {
+        return std::isspace(ch) != 0;
+    });
+}
+
+void ensure_token_mask(std::vector<uint8_t> &mask, size_t token_count, uint8_t value) {
+    if(mask.size() != token_count) {
+        mask.assign(token_count, value);
+    }
+}
+
 Int64Tensor make_ids_tensor(const std::vector<int64_t> &ids) {
     return {ids, {1, static_cast<int64_t>(ids.size())}};
 }
@@ -588,6 +620,304 @@ bool input_name_is(const std::string &name, std::initializer_list<std::string_vi
         }
     }
     return false;
+}
+
+bool tensor_spec_has_dynamic_batch_axis(const gonx::TensorSpec &spec, int64_t batch_count) {
+    if(batch_count <= 1 || spec.shape.empty()) {
+        return true;
+    }
+    const int64_t batch_axis = spec.shape.front();
+    return batch_axis < 0 || batch_axis == batch_count;
+}
+
+bool timestep_spec_allows_shared_scalar(const gonx::TensorSpec &spec) {
+    return spec.shape.size() == 1 && spec.shape.front() == 1;
+}
+
+bool dit_step_supports_batched_cfg(const OptionalSession &dit_step, int64_t batch_count) {
+    if(!dit_step.loaded) {
+        return false;
+    }
+    for(const gonx::TensorSpec &spec : dit_step.session.input_specs()) {
+        if(input_name_is(spec.name, {"t", "timestep", "timesteps"})) {
+            if(!tensor_spec_has_dynamic_batch_axis(spec, batch_count) &&
+               !timestep_spec_allows_shared_scalar(spec)) {
+                return false;
+            }
+        } else if(input_name_is(spec.name, {
+            "x_t", "latent", "z_t",
+            "text_state", "text_mask",
+            "latent_mask", "x_mask", "self_mask",
+            "speaker_state", "speaker_mask",
+            "caption_state", "caption_mask",
+        }) && !tensor_spec_has_dynamic_batch_axis(spec, batch_count)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+Result<size_t> batch_item_count(
+    const std::vector<int64_t> &shape,
+    size_t value_count,
+    std::string_view label
+) {
+    if(shape.empty() || shape.front() <= 0) {
+        return Error::shape_mismatch(std::string(label) + " must have a concrete batch axis");
+    }
+    const size_t batch = static_cast<size_t>(shape.front());
+    if(batch == 0 || value_count % batch != 0) {
+        return Error::shape_mismatch(std::string(label) + " values do not match shape batch axis");
+    }
+    return value_count / batch;
+}
+
+bool shape_tail_matches(const std::vector<int64_t> &lhs, const std::vector<int64_t> &rhs) {
+    if(lhs.size() != rhs.size()) {
+        return false;
+    }
+    for(size_t index = 1; index < lhs.size(); ++index) {
+        if(lhs[index] != rhs[index]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+Result<void> fill_repeated_float_tensor(
+    FloatTensor &target,
+    const FloatTensor &source,
+    size_t batch_count,
+    std::string_view label
+) {
+    auto item_count_result = batch_item_count(source.shape, source.values.size(), label);
+    if(!item_count_result.is_ok()) {
+        return item_count_result.get_error();
+    }
+    if(source.shape.front() != 1) {
+        return Error::shape_mismatch(std::string(label) + " source batch must be 1");
+    }
+    const size_t item_count = item_count_result.value();
+    target.shape = source.shape;
+    target.shape.front() = static_cast<int64_t>(batch_count);
+    target.values.resize(item_count * batch_count);
+    for(size_t batch_index = 0; batch_index < batch_count; ++batch_index) {
+        std::copy_n(
+            source.values.begin(),
+            item_count,
+            target.values.begin() + static_cast<std::ptrdiff_t>(batch_index * item_count)
+        );
+    }
+    return Result<void>();
+}
+
+Result<void> fill_repeated_bool_tensor(
+    BoolTensor &target,
+    const BoolTensor &source,
+    size_t batch_count,
+    std::string_view label
+) {
+    auto item_count_result = batch_item_count(source.shape, source.values.size(), label);
+    if(!item_count_result.is_ok()) {
+        return item_count_result.get_error();
+    }
+    if(source.shape.front() != 1) {
+        return Error::shape_mismatch(std::string(label) + " source batch must be 1");
+    }
+    const size_t item_count = item_count_result.value();
+    target.shape = source.shape;
+    target.shape.front() = static_cast<int64_t>(batch_count);
+    target.values.resize(item_count * batch_count);
+    for(size_t batch_index = 0; batch_index < batch_count; ++batch_index) {
+        std::copy_n(
+            source.values.begin(),
+            item_count,
+            target.values.begin() + static_cast<std::ptrdiff_t>(batch_index * item_count)
+        );
+    }
+    return Result<void>();
+}
+
+Result<void> fill_batched_float_tensor(
+    FloatTensor &target,
+    const std::vector<const FloatTensor *> &sources,
+    std::string_view label
+) {
+    if(sources.empty() || sources.front() == nullptr) {
+        return Error::invalid_argument(std::string(label) + " batch is empty");
+    }
+    auto item_count_result = batch_item_count(
+        sources.front()->shape,
+        sources.front()->values.size(),
+        label
+    );
+    if(!item_count_result.is_ok()) {
+        return item_count_result.get_error();
+    }
+    if(sources.front()->shape.front() != 1) {
+        return Error::shape_mismatch(std::string(label) + " source batch must be 1");
+    }
+    const size_t item_count = item_count_result.value();
+    target.shape = sources.front()->shape;
+    target.shape.front() = static_cast<int64_t>(sources.size());
+    target.values.resize(item_count * sources.size());
+    for(size_t batch_index = 0; batch_index < sources.size(); ++batch_index) {
+        const FloatTensor *source = sources[batch_index];
+        if(!source || source->shape.empty() || source->shape.front() != 1 ||
+           !shape_tail_matches(source->shape, sources.front()->shape) ||
+           source->values.size() != item_count) {
+            return Error::shape_mismatch(std::string(label) + " batch shapes do not match");
+        }
+        std::copy_n(
+            source->values.begin(),
+            item_count,
+            target.values.begin() + static_cast<std::ptrdiff_t>(batch_index * item_count)
+        );
+    }
+    return Result<void>();
+}
+
+Result<void> fill_batched_bool_tensor(
+    BoolTensor &target,
+    const std::vector<const BoolTensor *> &sources,
+    std::string_view label
+) {
+    if(sources.empty() || sources.front() == nullptr) {
+        return Error::invalid_argument(std::string(label) + " batch is empty");
+    }
+    auto item_count_result = batch_item_count(
+        sources.front()->shape,
+        sources.front()->values.size(),
+        label
+    );
+    if(!item_count_result.is_ok()) {
+        return item_count_result.get_error();
+    }
+    if(sources.front()->shape.front() != 1) {
+        return Error::shape_mismatch(std::string(label) + " source batch must be 1");
+    }
+    const size_t item_count = item_count_result.value();
+    target.shape = sources.front()->shape;
+    target.shape.front() = static_cast<int64_t>(sources.size());
+    target.values.resize(item_count * sources.size());
+    for(size_t batch_index = 0; batch_index < sources.size(); ++batch_index) {
+        const BoolTensor *source = sources[batch_index];
+        if(!source || source->shape.empty() || source->shape.front() != 1 ||
+           !shape_tail_matches(source->shape, sources.front()->shape) ||
+           source->values.size() != item_count) {
+            return Error::shape_mismatch(std::string(label) + " batch shapes do not match");
+        }
+        std::copy_n(
+            source->values.begin(),
+            item_count,
+            target.values.begin() + static_cast<std::ptrdiff_t>(batch_index * item_count)
+        );
+    }
+    return Result<void>();
+}
+
+Result<void> fill_batched_conditions(
+    ConditionState &target,
+    const std::vector<const ConditionState *> &sources
+) {
+    if(sources.empty() || sources.front() == nullptr) {
+        return Error::invalid_argument("condition batch is empty");
+    }
+    std::vector<const FloatTensor *> text_states;
+    std::vector<const BoolTensor *> text_masks;
+    std::vector<const FloatTensor *> speaker_states;
+    std::vector<const BoolTensor *> speaker_masks;
+    std::vector<const FloatTensor *> caption_states;
+    std::vector<const BoolTensor *> caption_masks;
+    text_states.reserve(sources.size());
+    text_masks.reserve(sources.size());
+    speaker_states.reserve(sources.size());
+    speaker_masks.reserve(sources.size());
+    caption_states.reserve(sources.size());
+    caption_masks.reserve(sources.size());
+
+    const bool has_speaker = sources.front()->has_speaker;
+    const bool has_caption = sources.front()->has_caption;
+    for(const ConditionState *source : sources) {
+        if(!source || source->has_speaker != has_speaker || source->has_caption != has_caption) {
+            return Error::shape_mismatch("condition batch feature flags do not match");
+        }
+        text_states.push_back(&source->text_state);
+        text_masks.push_back(&source->text_mask);
+        if(has_speaker) {
+            speaker_states.push_back(&source->speaker_state);
+            speaker_masks.push_back(&source->speaker_mask);
+        }
+        if(has_caption) {
+            caption_states.push_back(&source->caption_state);
+            caption_masks.push_back(&source->caption_mask);
+        }
+    }
+
+    auto status = fill_batched_float_tensor(target.text_state, text_states, "text_state");
+    if(!status.is_ok()) {
+        return status;
+    }
+    status = fill_batched_bool_tensor(target.text_mask, text_masks, "text_mask");
+    if(!status.is_ok()) {
+        return status;
+    }
+    target.has_speaker = has_speaker;
+    target.has_caption = has_caption;
+    if(has_speaker) {
+        status = fill_batched_float_tensor(target.speaker_state, speaker_states, "speaker_state");
+        if(!status.is_ok()) {
+            return status;
+        }
+        status = fill_batched_bool_tensor(target.speaker_mask, speaker_masks, "speaker_mask");
+        if(!status.is_ok()) {
+            return status;
+        }
+    }
+    if(has_caption) {
+        status = fill_batched_float_tensor(target.caption_state, caption_states, "caption_state");
+        if(!status.is_ok()) {
+            return status;
+        }
+        status = fill_batched_bool_tensor(target.caption_mask, caption_masks, "caption_mask");
+        if(!status.is_ok()) {
+            return status;
+        }
+    }
+    return Result<void>();
+}
+
+Result<FloatTensor> slice_batched_float_tensor(
+    const FloatTensor &source,
+    size_t batch_index,
+    size_t expected_batch,
+    const FloatTensor &reference,
+    std::string_view label
+) {
+    auto item_count_result = batch_item_count(source.shape, source.values.size(), label);
+    if(!item_count_result.is_ok()) {
+        return item_count_result.get_error();
+    }
+    if(source.shape.front() != static_cast<int64_t>(expected_batch) || batch_index >= expected_batch) {
+        return Error::shape_mismatch(std::string(label) + " output batch does not match request");
+    }
+    const size_t item_count = item_count_result.value();
+    if(item_count != reference.values.size()) {
+        return Error::shape_mismatch(
+            std::string(label) + " output item shape does not match latent shape"
+        );
+    }
+
+    FloatTensor output;
+    output.shape = source.shape;
+    output.shape.front() = 1;
+    output.values.resize(item_count);
+    std::copy_n(
+        source.values.begin() + static_cast<std::ptrdiff_t>(batch_index * item_count),
+        item_count,
+        output.values.begin()
+    );
+    return output;
 }
 
 Result<std::vector<Ort::Value>> run_text_encoder(
@@ -1035,6 +1365,10 @@ Result<int32_t> run_duration_predictor(
         std::vector<uint8_t>{conditions.has_speaker ? uint8_t{1} : uint8_t{0}},
         {1},
     };
+    BoolTensor has_caption{
+        std::vector<uint8_t>{conditions.has_caption ? uint8_t{1} : uint8_t{0}},
+        {1},
+    };
 
     std::vector<Ort::Value> inputs;
     inputs.reserve(predictor.session.input_specs().size());
@@ -1049,10 +1383,16 @@ Result<int32_t> run_duration_predictor(
             value = make_float_input(conditions.speaker_state);
         } else if(input_name_is(spec.name, {"speaker_mask"})) {
             value = make_bool_input(conditions.speaker_mask, spec.element_type);
+        } else if(input_name_is(spec.name, {"caption_state"})) {
+            value = make_float_input(conditions.caption_state);
+        } else if(input_name_is(spec.name, {"caption_mask"})) {
+            value = make_bool_input(conditions.caption_mask, spec.element_type);
         } else if(input_name_is(spec.name, {"duration_features", "features", "aux_features"})) {
             value = make_float_input(duration_features);
         } else if(input_name_is(spec.name, {"has_speaker", "duration_has_speaker"})) {
             value = make_bool_input(has_speaker, spec.element_type);
+        } else if(input_name_is(spec.name, {"has_caption", "duration_has_caption"})) {
+            value = make_bool_input(has_caption, spec.element_type);
         } else {
             return Error::invalid_argument("duration predictor has unsupported input '" + spec.name + "'");
         }
@@ -1132,8 +1472,118 @@ Result<FloatTensor> run_dit_step(
         }
         inputs.push_back(std::move(value.value()));
     }
-    add_metric(metrics, "dit_step_input_tensor_ms", elapsed_ms_since(input_started));
+    const double input_ms = elapsed_ms_since(input_started);
+    add_metric(metrics, "dit_step_input_tensor_ms", input_ms);
+    add_metric(metrics, "dit_step_tensor_pack_ms", input_ms);
     add_metric(metrics, "dit_step_invocations", 1.0);
+    add_metric(metrics, "dit_step_logical_invocations", 1.0);
+    max_metric(metrics, "dit_step_max_batch_size", 1.0);
+
+    const auto run_started = SteadyClock::now();
+    auto run_result = dit_step.session.run(inputs);
+    add_metric(metrics, "dit_step_ort_run_ms", elapsed_ms_since(run_started));
+    if(run_result.has_error()) {
+        return Error::inference_failed("DiT step failed: " + run_result.error().message);
+    }
+    auto outputs = std::move(run_result.value());
+    if(outputs.empty()) {
+        return Error::inference_failed("DiT step returned no outputs");
+    }
+    const auto output_started = SteadyClock::now();
+    auto tensor_result = tensor_to_float_tensor(outputs.front(), "dit_v_pred");
+    add_metric(metrics, "dit_step_output_tensor_ms", elapsed_ms_since(output_started));
+    return tensor_result;
+}
+
+Result<FloatTensor> run_dit_step_batched(
+    OptionalSession &dit_step,
+    const FloatTensor &x_t,
+    float t,
+    const std::vector<const ConditionState *> &condition_batch,
+    const BoolTensor &latent_mask,
+    RfBatchWorkspace &workspace,
+    std::map<std::string, double> *metrics = nullptr
+) {
+    if(!dit_step.loaded) {
+        return Error::model_not_loaded("DiT step is not loaded");
+    }
+    if(condition_batch.empty()) {
+        return Error::invalid_argument("DiT batched step received no condition branches");
+    }
+    const size_t batch_count = condition_batch.size();
+    if(!dit_step_supports_batched_cfg(dit_step, static_cast<int64_t>(batch_count))) {
+        return Error::shape_mismatch(
+            "DiT step graph does not expose a dynamic batch axis for batched CFG"
+        );
+    }
+
+    const auto pack_started = SteadyClock::now();
+    auto status = fill_repeated_float_tensor(workspace.x_t_batch, x_t, batch_count, "x_t");
+    if(!status.is_ok()) {
+        return status.get_error();
+    }
+    status = fill_repeated_bool_tensor(
+        workspace.latent_mask_batch,
+        latent_mask,
+        batch_count,
+        "latent_mask"
+    );
+    if(!status.is_ok()) {
+        return status.get_error();
+    }
+    status = fill_batched_conditions(workspace.conditions_batch, condition_batch);
+    if(!status.is_ok()) {
+        return status.get_error();
+    }
+    const double pack_ms = elapsed_ms_since(pack_started);
+    add_metric(metrics, "dit_step_batch_pack_ms", pack_ms);
+
+    std::vector<Ort::Value> inputs;
+    inputs.reserve(dit_step.session.input_specs().size());
+    const auto input_started = SteadyClock::now();
+    for(const gonx::TensorSpec &spec : dit_step.session.input_specs()) {
+        Result<Ort::Value> value = Error::invalid_argument("unmatched DiT input");
+        if(input_name_is(spec.name, {"x_t", "latent", "z_t"})) {
+            value = make_float_input(workspace.x_t_batch);
+        } else if(input_name_is(spec.name, {"t", "timestep", "timesteps"})) {
+            if(timestep_spec_allows_shared_scalar(spec) &&
+               !tensor_spec_has_dynamic_batch_axis(spec, static_cast<int64_t>(batch_count))) {
+                workspace.t_batch.shape = {1};
+                workspace.t_batch.values.assign(1, t);
+            } else {
+                workspace.t_batch.shape = {static_cast<int64_t>(batch_count)};
+                workspace.t_batch.values.assign(batch_count, t);
+            }
+            value = make_float_input(workspace.t_batch);
+        } else if(input_name_is(spec.name, {"text_state"})) {
+            value = make_float_input(workspace.conditions_batch.text_state);
+        } else if(input_name_is(spec.name, {"text_mask"})) {
+            value = make_bool_input(workspace.conditions_batch.text_mask, spec.element_type);
+        } else if(input_name_is(spec.name, {"latent_mask", "x_mask", "self_mask"})) {
+            value = make_bool_input(workspace.latent_mask_batch, spec.element_type);
+        } else if(input_name_is(spec.name, {"speaker_state"})) {
+            value = make_float_input(workspace.conditions_batch.speaker_state);
+        } else if(input_name_is(spec.name, {"speaker_mask"})) {
+            value = make_bool_input(workspace.conditions_batch.speaker_mask, spec.element_type);
+        } else if(input_name_is(spec.name, {"caption_state"})) {
+            value = make_float_input(workspace.conditions_batch.caption_state);
+        } else if(input_name_is(spec.name, {"caption_mask"})) {
+            value = make_bool_input(workspace.conditions_batch.caption_mask, spec.element_type);
+        } else {
+            return Error::invalid_argument("DiT step has unsupported input '" + spec.name + "'");
+        }
+        if(!value.is_ok()) {
+            return value.get_error();
+        }
+        inputs.push_back(std::move(value.value()));
+    }
+    const double input_ms = elapsed_ms_since(input_started);
+    add_metric(metrics, "dit_step_input_tensor_ms", input_ms);
+    add_metric(metrics, "dit_step_tensor_pack_ms", pack_ms + input_ms);
+    add_metric(metrics, "dit_step_invocations", 1.0);
+    add_metric(metrics, "dit_step_batched_invocations", 1.0);
+    add_metric(metrics, "dit_step_logical_invocations", static_cast<double>(batch_count));
+    max_metric(metrics, "dit_step_max_batch_size", static_cast<double>(batch_count));
 
     const auto run_started = SteadyClock::now();
     auto run_result = dit_step.session.run(inputs);
@@ -1242,6 +1692,19 @@ void add_guided_velocity(
     }
 }
 
+float cfg_scale_for_branch(const IrodoriTtsRequest &request, const std::string &branch) {
+    if(request.cfg_scale.has_value()) {
+        return *request.cfg_scale;
+    }
+    if(branch == "speaker") {
+        return request.cfg_scale_speaker;
+    }
+    if(branch == "caption") {
+        return request.cfg_scale_caption;
+    }
+    return request.cfg_scale_text;
+}
+
 Result<FloatTensor> sample_rf(
     OptionalSession &dit_step,
     const IrodoriTtsSessionConfig &config,
@@ -1255,7 +1718,6 @@ Result<FloatTensor> sample_rf(
     std::map<std::string, double> *metrics = nullptr,
     std::map<std::string, std::string> *diagnostics = nullptr
 ) {
-    add_diagnostic(diagnostics, "rf_execution_mode", "cpu_vector");
     const int32_t patched_dim = std::max(1, config.latent_dim * config.latent_patch_size);
     FloatTensor x_t;
     x_t.shape = {1, patched_steps, patched_dim};
@@ -1273,6 +1735,33 @@ Result<FloatTensor> sample_rf(
     const std::string guidance = lower_ascii(
         request.cfg_guidance_mode.empty() ? config.default_cfg_guidance_mode : request.cfg_guidance_mode
     );
+    auto max_step_branches_result = build_irodori_cfg_step_drop_branches(branches, guidance, 0);
+    if(!max_step_branches_result.is_ok()) {
+        return max_step_branches_result.get_error();
+    }
+    const size_t max_batch_count = branches.size() > 1 ?
+        1 + max_step_branches_result.value().size() :
+        1;
+    const std::string requested_execution_mode = lower_ascii(
+        config.rf_execution_mode.empty() ? "auto" : config.rf_execution_mode
+    );
+    const bool batched_cfg_available = max_batch_count > 1 &&
+        dit_step_supports_batched_cfg(dit_step, static_cast<int64_t>(max_batch_count));
+    const bool batched_cfg_requested = requested_execution_mode == "batched_cfg" ||
+        (requested_execution_mode == "auto" && batched_cfg_available);
+    const bool use_batched_cfg = batched_cfg_requested && batched_cfg_available;
+    add_diagnostic(diagnostics, "rf_execution_mode", use_batched_cfg ? "batched_cfg" : "cpu_vector");
+    add_diagnostic(diagnostics, "rf_batched_cfg_available", batched_cfg_available ? "true" : "false");
+    add_diagnostic(diagnostics, "rf_cfg_batch_max_plan", std::to_string(max_batch_count));
+    if(batched_cfg_requested && !batched_cfg_available) {
+        add_diagnostic(
+            diagnostics,
+            "rf_batched_cfg_fallback_reason",
+            "dit_step_graph_has_fixed_batch_axis"
+        );
+    }
+    set_metric(metrics, "rf_cfg_batch_max_plan", static_cast<double>(max_batch_count));
+
     std::unordered_map<std::string, ConditionState> dropped_conditions;
     auto dropped_condition_for = [&](const std::string &branch) -> const ConditionState & {
         auto found = dropped_conditions.find(branch);
@@ -1283,6 +1772,7 @@ Result<FloatTensor> sample_rf(
         return inserted.first->second;
     };
 
+    RfBatchWorkspace batch_workspace;
     for(size_t step = 0; step + 1 < schedule.size(); ++step) {
         const auto step_started = SteadyClock::now();
         if(cancel && cancel->is_cancelled()) {
@@ -1293,30 +1783,80 @@ Result<FloatTensor> sample_rf(
         const bool use_cfg = !branches.empty() && branches.size() > 1 &&
             request.cfg_min_t <= t && t <= request.cfg_max_t;
 
-        auto cond_result = run_dit_step(dit_step, x_t, t, conditions, latent_mask, metrics);
-        if(!cond_result.is_ok()) {
-            return cond_result.get_error();
-        }
-        FloatTensor v = cond_result.value();
+        std::vector<std::string> step_drop_branches;
         if(use_cfg) {
-            if(guidance == "joint") {
-                auto uncond_result = run_dit_step(
-                    dit_step,
+            auto step_branches_result = build_irodori_cfg_step_drop_branches(branches, guidance, step);
+            if(!step_branches_result.is_ok()) {
+                return step_branches_result.get_error();
+            }
+            step_drop_branches = std::move(step_branches_result.value());
+        }
+
+        FloatTensor v;
+        if(use_batched_cfg && use_cfg && !step_drop_branches.empty()) {
+            batch_workspace.condition_refs.clear();
+            batch_workspace.condition_refs.reserve(1 + step_drop_branches.size());
+            batch_workspace.condition_refs.push_back(&conditions);
+            for(const std::string &branch : step_drop_branches) {
+                batch_workspace.condition_refs.push_back(&dropped_condition_for(branch));
+            }
+
+            auto batched_result = run_dit_step_batched(
+                dit_step,
+                x_t,
+                t,
+                batch_workspace.condition_refs,
+                latent_mask,
+                batch_workspace,
+                metrics
+            );
+            if(!batched_result.is_ok()) {
+                return batched_result.get_error();
+            }
+            auto cond_slice_result = slice_batched_float_tensor(
+                batched_result.value(),
+                0,
+                batch_workspace.condition_refs.size(),
+                x_t,
+                "dit_v_pred"
+            );
+            if(!cond_slice_result.is_ok()) {
+                return cond_slice_result.get_error();
+            }
+            FloatTensor cond_velocity = std::move(cond_slice_result.value());
+            v = cond_velocity;
+            for(size_t branch_index = 0; branch_index < step_drop_branches.size(); ++branch_index) {
+                auto uncond_slice_result = slice_batched_float_tensor(
+                    batched_result.value(),
+                    branch_index + 1,
+                    batch_workspace.condition_refs.size(),
                     x_t,
-                    t,
-                    dropped_condition_for("all"),
-                    latent_mask,
-                    metrics
+                    "dit_v_pred"
                 );
-                if(!uncond_result.is_ok()) {
-                    return uncond_result.get_error();
+                if(!uncond_slice_result.is_ok()) {
+                    return uncond_slice_result.get_error();
                 }
-                const float scale = request.cfg_scale.has_value() ? *request.cfg_scale : request.cfg_scale_text;
-                add_guided_velocity(v.values, cond_result.value().values, uncond_result.value().values, scale);
-            } else if(guidance == "alternating") {
-                const size_t branch_index = 1 + (step % (branches.size() - 1));
-                const std::string branch = branches[branch_index].rfind("drop_", 0) == 0 ?
-                    branches[branch_index].substr(5) : branches[branch_index];
+                const auto cfg_started = SteadyClock::now();
+                add_guided_velocity(
+                    v.values,
+                    cond_velocity.values,
+                    uncond_slice_result.value().values,
+                    cfg_scale_for_branch(request, step_drop_branches[branch_index])
+                );
+                add_metric(metrics, "cfg_combine_ms", elapsed_ms_since(cfg_started));
+            }
+            set_metric(
+                metrics,
+                "rf_step_" + std::to_string(step) + "_cfg_batch_size",
+                static_cast<double>(batch_workspace.condition_refs.size())
+            );
+        } else {
+            auto cond_result = run_dit_step(dit_step, x_t, t, conditions, latent_mask, metrics);
+            if(!cond_result.is_ok()) {
+                return cond_result.get_error();
+            }
+            v = cond_result.value();
+            for(const std::string &branch : step_drop_branches) {
                 auto uncond_result = run_dit_step(
                     dit_step,
                     x_t,
@@ -1328,43 +1868,20 @@ Result<FloatTensor> sample_rf(
                 if(!uncond_result.is_ok()) {
                     return uncond_result.get_error();
                 }
-                float scale = request.cfg_scale_text;
-                if(branch == "speaker") {
-                    scale = request.cfg_scale_speaker;
-                } else if(branch == "caption") {
-                    scale = request.cfg_scale_caption;
-                }
-                if(request.cfg_scale.has_value()) {
-                    scale = *request.cfg_scale;
-                }
-                add_guided_velocity(v.values, cond_result.value().values, uncond_result.value().values, scale);
-            } else {
-                for(size_t branch_index = 1; branch_index < branches.size(); ++branch_index) {
-                    const std::string branch = branches[branch_index].rfind("drop_", 0) == 0 ?
-                        branches[branch_index].substr(5) : branches[branch_index];
-                    auto uncond_result = run_dit_step(
-                        dit_step,
-                        x_t,
-                        t,
-                        dropped_condition_for(branch),
-                        latent_mask,
-                        metrics
-                    );
-                    if(!uncond_result.is_ok()) {
-                        return uncond_result.get_error();
-                    }
-                    float scale = request.cfg_scale_text;
-                    if(branch == "speaker") {
-                        scale = request.cfg_scale_speaker;
-                    } else if(branch == "caption") {
-                        scale = request.cfg_scale_caption;
-                    }
-                    if(request.cfg_scale.has_value()) {
-                        scale = *request.cfg_scale;
-                    }
-                    add_guided_velocity(v.values, cond_result.value().values, uncond_result.value().values, scale);
-                }
+                const auto cfg_started = SteadyClock::now();
+                add_guided_velocity(
+                    v.values,
+                    cond_result.value().values,
+                    uncond_result.value().values,
+                    cfg_scale_for_branch(request, branch)
+                );
+                add_metric(metrics, "cfg_combine_ms", elapsed_ms_since(cfg_started));
             }
+            set_metric(
+                metrics,
+                "rf_step_" + std::to_string(step) + "_cfg_batch_size",
+                1.0
+            );
         }
 
         if(v.values.size() != x_t.values.size()) {
@@ -1374,9 +1891,11 @@ Result<FloatTensor> sample_rf(
             );
         }
         const float dt = t_next - t;
+        const auto update_started = SteadyClock::now();
         for(size_t index = 0; index < x_t.values.size(); ++index) {
             x_t.values[index] += v.values[index] * dt;
         }
+        add_metric(metrics, "rf_euler_update_ms", elapsed_ms_since(update_started));
         add_metric(metrics, "rf_step_total_ms", elapsed_ms_since(step_started));
         set_metric(metrics, "rf_step_" + std::to_string(step) + "_ms", elapsed_ms_since(step_started));
     }
@@ -1767,6 +2286,9 @@ IrodoriTtsMode parse_irodori_tts_mode(const std::string &mode) {
     if(normalized == "voice_design_v2" || normalized == "voice_design" || normalized == "voicedesign") {
         return IrodoriTtsMode::VoiceDesignV2;
     }
+    if(normalized == "voice_design_v3" || normalized == "voicedesign_v3") {
+        return IrodoriTtsMode::VoiceDesignV3;
+    }
     return IrodoriTtsMode::Unknown;
 }
 
@@ -1778,6 +2300,8 @@ std::string irodori_tts_mode_name(IrodoriTtsMode mode) {
             return "base_v2";
         case IrodoriTtsMode::VoiceDesignV2:
             return "voice_design_v2";
+        case IrodoriTtsMode::VoiceDesignV3:
+            return "voice_design_v3";
         case IrodoriTtsMode::Unknown:
         default:
             return "unknown";
@@ -1785,12 +2309,24 @@ std::string irodori_tts_mode_name(IrodoriTtsMode mode) {
 }
 
 bool irodori_tts_mode_uses_caption(IrodoriTtsMode mode) {
-    return mode == IrodoriTtsMode::VoiceDesignV2;
+    return mode == IrodoriTtsMode::VoiceDesignV2 ||
+        mode == IrodoriTtsMode::VoiceDesignV3;
 }
 
 bool irodori_tts_mode_uses_speaker(IrodoriTtsMode mode) {
-    return mode == IrodoriTtsMode::BaseV2 || mode == IrodoriTtsMode::BaseV3;
+    return mode == IrodoriTtsMode::BaseV2 ||
+        mode == IrodoriTtsMode::BaseV3 ||
+        mode == IrodoriTtsMode::VoiceDesignV3;
 }
+
+namespace {
+
+bool irodori_tts_mode_uses_duration_predictor(IrodoriTtsMode mode) {
+    return mode == IrodoriTtsMode::BaseV3 ||
+        mode == IrodoriTtsMode::VoiceDesignV3;
+}
+
+} // namespace
 
 Result<std::vector<float>> build_irodori_sway_schedule(
     int32_t num_steps,
@@ -1914,6 +2450,47 @@ Result<std::vector<std::string>> build_irodori_cfg_branches(
     return branches;
 }
 
+Result<std::vector<std::string>> build_irodori_cfg_step_drop_branches(
+    const std::vector<std::string> &branches,
+    const std::string &guidance_mode,
+    size_t step_index
+) {
+    if(branches.size() <= 1) {
+        return std::vector<std::string>{};
+    }
+
+    const std::string guidance = lower_ascii(guidance_mode.empty() ? "independent" : guidance_mode);
+    std::vector<std::string> output;
+    if(guidance == "joint") {
+        output.push_back("all");
+        return output;
+    }
+    if(guidance == "alternating") {
+        const size_t branch_index = 1 + (step_index % (branches.size() - 1));
+        std::string branch = branches[branch_index];
+        if(branch.rfind("drop_", 0) == 0) {
+            branch = branch.substr(5);
+        }
+        output.push_back(std::move(branch));
+        return output;
+    }
+    if(guidance != "independent") {
+        return Error::invalid_argument(
+            "build_irodori_cfg_step_drop_branches: unsupported CFG guidance mode"
+        );
+    }
+
+    output.reserve(branches.size() - 1);
+    for(size_t branch_index = 1; branch_index < branches.size(); ++branch_index) {
+        std::string branch = branches[branch_index];
+        if(branch.rfind("drop_", 0) == 0) {
+            branch = branch.substr(5);
+        }
+        output.push_back(std::move(branch));
+    }
+    return output;
+}
+
 std::string build_irodori_condition_cache_key(
     IrodoriTtsMode mode,
     const std::string &text,
@@ -1940,6 +2517,7 @@ struct IrodoriTtsSession::Impl {
     OptionalSession dit_step;
     OptionalSession dacvae_encoder;
     OptionalSession dacvae_decoder;
+    IrodoriTextTokenizer tokenizer;
     std::vector<StaticDitSession> coreml_static_dit_steps;
     std::vector<std::string> coreml_static_bucket_lru;
     std::mutex cache_mutex;
@@ -1958,7 +2536,7 @@ Result<void> IrodoriTtsSession::load(const IrodoriTtsSessionConfig &config) {
     impl_->config = config;
 
     if(config.mode == IrodoriTtsMode::Unknown) {
-        return Error::invalid_argument("IrodoriTtsSession::load: mode must be base_v3, base_v2, or voice_design_v2");
+        return Error::invalid_argument("IrodoriTtsSession::load: mode must be base_v3, base_v2, voice_design_v2, or voice_design_v3");
     }
     if(config.sample_rate != 48000) {
         return Error::invalid_argument("IrodoriTtsSession::load: Irodori runtime expects 48000 Hz output");
@@ -1999,6 +2577,20 @@ Result<void> IrodoriTtsSession::load(const IrodoriTtsSessionConfig &config) {
         "force_cpu" : config.runtime_dispatch);
     const bool cpu_dispatch_required = load_dispatch_mode == "force_cpu" ||
         load_dispatch_mode == "auto_dispatch";
+
+    if(config.artifacts.tokenizer_json_path.empty()) {
+        if(require) {
+            return Error::invalid_argument("IrodoriTtsSession::load: missing tokenizer JSON path");
+        }
+    } else {
+        auto tokenizer_result = impl_->tokenizer.load(
+            config.artifacts.tokenizer_json_path,
+            config.artifacts.tokenizer_config_path
+        );
+        if(!tokenizer_result.is_ok() && require) {
+            return tokenizer_result.get_error();
+        }
+    }
 
     auto load_stage = [&](OptionalSession &session,
                           const std::string &path,
@@ -2050,7 +2642,7 @@ Result<void> IrodoriTtsSession::load(const IrodoriTtsSessionConfig &config) {
     load_result = load_stage(
         impl_->duration_predictor,
         config.artifacts.duration_predictor_onnx_path,
-        require && config.mode == IrodoriTtsMode::BaseV3,
+        require && irodori_tts_mode_uses_duration_predictor(config.mode),
         config.provider_routes.duration_predictor,
         "duration predictor"
     );
@@ -2124,7 +2716,7 @@ Result<void> IrodoriTtsSession::load(const IrodoriTtsSessionConfig &config) {
             (static_profile && !cpu_dispatch_required && !impl_->coreml_static_dit_steps.empty())) &&
         impl_->dacvae_decoder.loaded &&
         (!uses_caption || impl_->caption_encoder.loaded) &&
-        (config.mode != IrodoriTtsMode::BaseV3 || impl_->duration_predictor.loaded);
+        (!irodori_tts_mode_uses_duration_predictor(config.mode) || impl_->duration_predictor.loaded);
     if(uses_speaker) {
         impl_->execution_ready = impl_->execution_ready &&
             impl_->speaker_encoder.loaded &&
@@ -2157,29 +2749,91 @@ Result<IrodoriTtsSynthesisResult> IrodoriTtsSession::synthesize(
     if(!is_loaded()) {
         return Error::model_not_loaded("IrodoriTtsSession::synthesize: session is not loaded");
     }
-    if(request.text.empty()) {
+    IrodoriTtsRequest effective_request = request;
+    effective_request.text = normalize_irodori_v3_text(effective_request.text);
+    effective_request.caption = normalize_irodori_v3_text(effective_request.caption);
+
+    if(effective_request.text.empty()) {
         return Error::empty_input("IrodoriTtsSession::synthesize: text is empty");
     }
 
-    const int32_t num_steps = request.num_steps > 0 ? request.num_steps : impl_->config.default_num_steps;
-    const std::string schedule_mode = request.t_schedule_mode.empty() ?
-        impl_->config.default_t_schedule_mode : request.t_schedule_mode;
-    const float sway_coeff = is_finite(request.sway_coeff) ? request.sway_coeff : impl_->config.default_sway_coeff;
+    const auto tokenize_started = Clock::now();
+    if(effective_request.text_token_ids.empty()) {
+        if(!impl_->tokenizer.is_loaded()) {
+            return Error::model_not_loaded(
+                "IrodoriTtsSession::synthesize: tokenizer is not loaded for raw text request"
+            );
+        }
+        auto text_tokens = impl_->tokenizer.encode(
+            effective_request.text,
+            impl_->config.max_text_tokens,
+            false
+        );
+        if(!text_tokens.is_ok()) {
+            return text_tokens.get_error();
+        }
+        effective_request.text_token_ids = std::move(text_tokens.value().token_ids);
+        effective_request.text_token_mask = std::move(text_tokens.value().token_mask);
+    } else {
+        ensure_token_mask(effective_request.text_token_mask, effective_request.text_token_ids.size(), uint8_t{1});
+    }
+    if(irodori_tts_mode_uses_caption(impl_->config.mode)) {
+        if(effective_request.caption_token_ids.empty()) {
+            if(!impl_->tokenizer.is_loaded()) {
+                return Error::model_not_loaded(
+                    "IrodoriTtsSession::synthesize: tokenizer is not loaded for raw caption request"
+                );
+            }
+            auto caption_tokens = impl_->tokenizer.encode(
+                effective_request.caption,
+                impl_->config.max_caption_tokens,
+                is_ascii_blank(effective_request.caption)
+            );
+            if(!caption_tokens.is_ok()) {
+                return caption_tokens.get_error();
+            }
+            effective_request.caption_token_ids = std::move(caption_tokens.value().token_ids);
+            effective_request.caption_token_mask = std::move(caption_tokens.value().token_mask);
+        } else {
+            const uint8_t caption_mask_value = is_ascii_blank(effective_request.caption) ? uint8_t{0} : uint8_t{1};
+            ensure_token_mask(
+                effective_request.caption_token_mask,
+                effective_request.caption_token_ids.size(),
+                caption_mask_value
+            );
+        }
+    }
+    const double tokenize_ms = Ms(Clock::now() - tokenize_started).count();
+
+    if(effective_request.text_token_ids.empty()) {
+        return Error::invalid_argument("IrodoriTtsSession::synthesize: text tokenization produced no token ids");
+    }
+    if(irodori_tts_mode_uses_caption(impl_->config.mode) && effective_request.caption_token_ids.empty()) {
+        return Error::invalid_argument(
+            "IrodoriTtsSession::synthesize: caption tokenization produced no token ids for VoiceDesign mode"
+        );
+    }
+
+    const int32_t num_steps = effective_request.num_steps > 0 ? effective_request.num_steps : impl_->config.default_num_steps;
+    const std::string schedule_mode = effective_request.t_schedule_mode.empty() ?
+        impl_->config.default_t_schedule_mode : effective_request.t_schedule_mode;
+    const float sway_coeff = is_finite(effective_request.sway_coeff) ?
+        effective_request.sway_coeff : impl_->config.default_sway_coeff;
     auto schedule_result = build_irodori_sway_schedule(num_steps, schedule_mode, sway_coeff);
     if(!schedule_result.is_ok()) {
         return schedule_result.get_error();
     }
 
-    float cfg_scale_text = request.cfg_scale_text;
-    float cfg_scale_caption = request.cfg_scale_caption;
-    float cfg_scale_speaker = request.cfg_scale_speaker;
-    if(request.cfg_scale.has_value()) {
-        cfg_scale_text = *request.cfg_scale;
-        cfg_scale_caption = *request.cfg_scale;
-        cfg_scale_speaker = *request.cfg_scale;
+    float cfg_scale_text = effective_request.cfg_scale_text;
+    float cfg_scale_caption = effective_request.cfg_scale_caption;
+    float cfg_scale_speaker = effective_request.cfg_scale_speaker;
+    if(effective_request.cfg_scale.has_value()) {
+        cfg_scale_text = *effective_request.cfg_scale;
+        cfg_scale_caption = *effective_request.cfg_scale;
+        cfg_scale_speaker = *effective_request.cfg_scale;
     }
-    const std::string guidance_mode = request.cfg_guidance_mode.empty() ?
-        impl_->config.default_cfg_guidance_mode : request.cfg_guidance_mode;
+    const std::string guidance_mode = effective_request.cfg_guidance_mode.empty() ?
+        impl_->config.default_cfg_guidance_mode : effective_request.cfg_guidance_mode;
     auto cfg_result = build_irodori_cfg_branches(
         impl_->config.mode,
         guidance_mode.empty() ? "independent" : guidance_mode,
@@ -2199,17 +2853,6 @@ Result<IrodoriTtsSynthesisResult> IrodoriTtsSession::synthesize(
             "IrodoriTtsSession::synthesize: exported Irodori ONNX artifacts are not all loaded"
         );
     }
-    if(request.text_token_ids.empty()) {
-        return Error::invalid_argument(
-            "IrodoriTtsSession::synthesize: text_token_ids are required; tokenize text before calling the native runtime"
-        );
-    }
-    if(irodori_tts_mode_uses_caption(impl_->config.mode) && request.caption_token_ids.empty()) {
-        return Error::invalid_argument(
-            "IrodoriTtsSession::synthesize: caption_token_ids are required for VoiceDesign mode"
-        );
-    }
-
     IrodoriTtsSynthesisResult output;
     output.sample_rate = impl_->config.sample_rate;
     output.mode = irodori_tts_mode_name(impl_->config.mode);
@@ -2244,14 +2887,15 @@ Result<IrodoriTtsSynthesisResult> IrodoriTtsSession::synthesize(
         output.timings_ms[name] = Ms(Clock::now() - stage_started).count();
     };
 
-    output.timings_ms["tokenize"] = 0.0;
+    output.timings_ms["tokenize"] = tokenize_ms;
 
     ConditionState conditions;
     int32_t ref_steps = 0;
-    const bool use_condition_cache = impl_->config.enable_context_kv_cache && request.context_kv_cache;
+    const bool use_condition_cache = impl_->config.enable_context_kv_cache && effective_request.context_kv_cache;
     const std::string condition_cache_key = use_condition_cache ?
-        build_condition_cache_key_internal(impl_->config, request) : std::string();
+        build_condition_cache_key_internal(impl_->config, effective_request) : std::string();
     bool used_condition_cache = false;
+    output.diagnostics["context_cache_mode"] = use_condition_cache ? "encoded_state" : "disabled";
     if(use_condition_cache) {
         std::lock_guard<std::mutex> lock(impl_->cache_mutex);
         auto cached = impl_->condition_cache.find(condition_cache_key);
@@ -2264,14 +2908,18 @@ Result<IrodoriTtsSynthesisResult> IrodoriTtsSession::synthesize(
             output.timings_ms["reference_prep"] = 0.0;
         }
     }
+    output.diagnostics["condition_cache_hit"] = used_condition_cache ? "true" : "false";
 
     auto stage_started = Clock::now();
     if(!used_condition_cache) {
-        const BoolTensor text_mask = make_mask_tensor(request.text_token_mask, request.text_token_ids.size());
+        const BoolTensor text_mask = make_mask_tensor(
+            effective_request.text_token_mask,
+            effective_request.text_token_ids.size()
+        );
         auto text_state_result = run_encoder_state(
             impl_->text_encoder,
-            request.text_token_ids,
-            request.text_token_mask,
+            effective_request.text_token_ids,
+            effective_request.text_token_mask,
             "text encoder"
         );
         if(!text_state_result.is_ok()) {
@@ -2281,11 +2929,14 @@ Result<IrodoriTtsSynthesisResult> IrodoriTtsSession::synthesize(
         conditions.text_mask = text_mask;
 
         if(irodori_tts_mode_uses_caption(impl_->config.mode)) {
-            const BoolTensor caption_mask = make_mask_tensor(request.caption_token_mask, request.caption_token_ids.size());
+            const BoolTensor caption_mask = make_mask_tensor(
+                effective_request.caption_token_mask,
+                effective_request.caption_token_ids.size()
+            );
             auto caption_state_result = run_encoder_state(
                 impl_->caption_encoder,
-                request.caption_token_ids,
-                request.caption_token_mask,
+                effective_request.caption_token_ids,
+                effective_request.caption_token_mask,
                 "caption encoder"
             );
             if(!caption_state_result.is_ok()) {
@@ -2302,7 +2953,7 @@ Result<IrodoriTtsSynthesisResult> IrodoriTtsSession::synthesize(
     if(!used_condition_cache && irodori_tts_mode_uses_speaker(impl_->config.mode)) {
         auto ref_result = prepare_reference_latent(
             impl_->config,
-            request,
+            effective_request,
             impl_->dacvae_encoder,
             impl_->ref_latent_cache,
             impl_->cache_mutex,
@@ -2314,8 +2965,10 @@ Result<IrodoriTtsSynthesisResult> IrodoriTtsSession::synthesize(
         }
         FloatTensor ref_latent = std::move(ref_result.value());
         ref_steps = ref_latent.shape.size() >= 2 ? static_cast<int32_t>(ref_latent.shape[1]) : 0;
-        const bool has_reference = !request.no_ref &&
-            (!request.ref_latent.empty() || !request.ref_latent_path.empty() || !request.ref_wav_path.empty());
+        const bool has_reference = !effective_request.no_ref &&
+            (!effective_request.ref_latent.empty() ||
+                !effective_request.ref_latent_path.empty() ||
+                !effective_request.ref_wav_path.empty());
         auto speaker_result = run_speaker_encoder(impl_->speaker_encoder, ref_latent, has_reference);
         if(!speaker_result.is_ok()) {
             return speaker_result.get_error();
@@ -2338,11 +2991,11 @@ Result<IrodoriTtsSynthesisResult> IrodoriTtsSession::synthesize(
 
     stage_started = Clock::now();
     int32_t latent_steps = 0;
-    if(request.seconds.has_value()) {
+    if(effective_request.seconds.has_value()) {
         latent_steps = std::max(
             1,
             static_cast<int32_t>(std::ceil(
-                static_cast<double>(*request.seconds) *
+                static_cast<double>(*effective_request.seconds) *
                 static_cast<double>(impl_->config.sample_rate) /
                 static_cast<double>(impl_->config.codec_hop_length)
             ))
@@ -2351,9 +3004,9 @@ Result<IrodoriTtsSynthesisResult> IrodoriTtsSession::synthesize(
         auto duration_result = run_duration_predictor(
             impl_->duration_predictor,
             impl_->config,
-            request,
+            effective_request,
             conditions,
-            static_cast<int64_t>(request.text_token_ids.size()),
+            static_cast<int64_t>(effective_request.text_token_ids.size()),
             &output.instrumentation_ms
         );
         if(!duration_result.is_ok()) {
@@ -2364,8 +3017,8 @@ Result<IrodoriTtsSynthesisResult> IrodoriTtsSession::synthesize(
         latent_steps = std::max(
             1,
             static_cast<int32_t>(std::ceil(
-                static_cast<float>(request.text_token_ids.size()) * 8.0f *
-                std::max(0.1f, request.duration_scale)
+                static_cast<float>(effective_request.text_token_ids.size()) * 8.0f *
+                std::max(0.1f, effective_request.duration_scale)
             ))
         );
     }
@@ -2374,9 +3027,9 @@ Result<IrodoriTtsSynthesisResult> IrodoriTtsSession::synthesize(
     auto bucket_result = select_irodori_bucket(
         impl_->config.buckets,
         latent_steps,
-        static_cast<int32_t>(request.text_token_ids.size()),
+        static_cast<int32_t>(effective_request.text_token_ids.size()),
         irodori_tts_mode_uses_caption(impl_->config.mode) ?
-            static_cast<int32_t>(request.caption_token_ids.size()) : 0,
+            static_cast<int32_t>(effective_request.caption_token_ids.size()) : 0,
         ref_steps
     );
     if(!bucket_result.is_ok()) {
@@ -2509,7 +3162,7 @@ Result<IrodoriTtsSynthesisResult> IrodoriTtsSession::synthesize(
         sample_rf_unrolled(
             *rf_sampler_session,
             impl_->config,
-            request,
+            effective_request,
             rf_conditions,
             patched_steps,
             rf_patched_steps,
@@ -2520,7 +3173,7 @@ Result<IrodoriTtsSynthesisResult> IrodoriTtsSession::synthesize(
         sample_rf(
             *dit_step_session,
             impl_->config,
-            request,
+            effective_request,
             rf_conditions,
             patched_steps,
             rf_patched_steps,

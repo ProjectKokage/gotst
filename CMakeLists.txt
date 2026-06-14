@@ -15,6 +15,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(GOTST_BUILD_GDEXTENSION "Build the Godot-facing GDExtension shared library" ON)
 option(GOTST_BUILD_TESTS "Build native tests" ON)
+option(GOTST_BUILD_CLI "Build the standalone gotst command-line tool" OFF)
 
 set(
     GOTST_GODORAMA_SOURCE_DIR
@@ -75,6 +76,7 @@ endif()
 if(NOT TARGET godot-llama-core AND NOT TARGET godot_llama::core)
     set(GODOT_LLAMA_BUILD_GDEXTENSION OFF CACHE BOOL "" FORCE)
     set(GODOT_LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(GODORAMA_BUILD_TOKENIZERS ON CACHE BOOL "" FORCE)
     add_subdirectory("${GOTST_GODORAMA_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/_deps/godorama" EXCLUDE_FROM_ALL)
 endif()
 
@@ -88,6 +90,14 @@ if(TARGET godot_llama::core)
     set(GOTST_GODORAMA_CORE_TARGET godot_llama::core)
 else()
     set(GOTST_GODORAMA_CORE_TARGET godot-llama-core)
+endif()
+
+if(TARGET godot_llama::tokenizers)
+    set(GOTST_TOKENIZERS_TARGET godot_llama::tokenizers)
+elseif(TARGET tokenizers_cpp)
+    set(GOTST_TOKENIZERS_TARGET tokenizers_cpp)
+else()
+    message(FATAL_ERROR "gotst text tokenization requires GODORAMA_BUILD_TOKENIZERS=ON to provide tokenizers_cpp")
 endif()
 
 add_library(gotst-ten-vad STATIC
@@ -131,7 +141,9 @@ add_library(gotst-core STATIC
     src/core/tts_prompt_assembly.cpp
     src/core/tts_code_generator.cpp
     src/core/tts_waveform_decoder.cpp
+    src/core/qwen_tts_pipeline.cpp
     src/core/irodori_tts_session.cpp
+    src/core/text_tokenization.cpp
     src/core/asr_token_decoder.cpp
     src/core/qwen3_forced_aligner.cpp
     src/core/ten_vad.cpp
@@ -151,6 +163,7 @@ target_link_libraries(gotst-core
     PUBLIC
         ${GOTST_GONX_CORE_TARGET}
         ${GOTST_GODORAMA_CORE_TARGET}
+        ${GOTST_TOKENIZERS_TARGET}
         gotst-ten-vad
 )
 
@@ -282,4 +295,8 @@ endif()
 if(GOTST_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests/unit)
+endif()
+
+if(GOTST_BUILD_CLI)
+    add_subdirectory(cli)
 endif()

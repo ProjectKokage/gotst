@@ -2,9 +2,13 @@
 
 #include "gotst/godot/speech_runtime_config.hpp"
 #include "gotst/core/asr_frontend.hpp"
+#include "core/onnx_embedding_utils.hpp"
 #include "core/sampling_utils.hpp"
 #include "gotst/core/speaker_mel.hpp"
 #include "gotst/core/tts_prompt_assembly.hpp"
+
+#include <gonx/core/provider.hpp>
+#include <gonx/core/session.hpp>
 
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/classes/json.hpp>
@@ -16,6 +20,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <limits>
 #include <span>
 #include <thread>
@@ -287,6 +292,19 @@ Dictionary pack_tts_prompt_result(const gotst::TtsPromptAssemblyResult &result) 
     return payload;
 }
 
+Dictionary pack_qwen_prompt_result(const gotst::QwenTtsPreparedPrompt &result) {
+    Dictionary payload = pack_tts_prompt_result(result.prompt);
+    payload["target_frames"] = result.target_frames;
+    payload["min_frames_before_eos"] = result.sampling.min_frames_before_eos;
+    payload["codebook_size"] = result.sampling.codebook_size;
+    payload["residual_groups"] = result.sampling.residual_groups;
+    payload["hidden_size"] = result.sampling.hidden_size;
+    payload["eos_token_id"] = result.sampling.eos_token_id;
+    payload["decode_prefix_frames"] = result.decode_prefix_frames;
+    payload["codec_groups"] = result.codec_groups;
+    return payload;
+}
+
 std::string dictionary_string(const Dictionary &dict, const char *key, const char *fallback = "") {
     return String(dict.get(key, fallback)).utf8().get_data();
 }
@@ -305,6 +323,70 @@ int64_t dictionary_i64(const Dictionary &dict, const char *key, int64_t fallback
 
 float dictionary_f32(const Dictionary &dict, const char *key, float fallback = 0.0f) {
     return static_cast<float>(dict.get(key, fallback));
+}
+
+gotst::QwenTtsPipelineConfig qwen_tts_config_from_dictionary(const Dictionary &config) {
+    gotst::QwenTtsPipelineConfig native;
+    native.tokenizer_json_path = dictionary_string(config, "tokenizer_json_path", "");
+    native.model_config_path = dictionary_string(config, "model_config_path", "");
+    native.generation_config_path = dictionary_string(config, "generation_config_path", "");
+    native.text_embedding_path = dictionary_string(config, "text_embedding_path", "");
+    native.text_projection_path = dictionary_string(config, "text_projection_path", "");
+    native.codec_embedding_path = dictionary_string(config, "codec_embedding_path", "");
+    native.predictor_embedding_path = dictionary_string(config, "predictor_embedding_path", "");
+    native.talker_gguf_path = dictionary_string(config, "talker_gguf_path", "");
+    native.predictor_gguf_path = dictionary_string(config, "predictor_gguf_path", "");
+    native.decoder_onnx_path = dictionary_string(config, "decoder_onnx_path", "");
+    native.speaker_embedding_path = dictionary_string(config, "speaker_embedding_path", "");
+    native.custom_voice_config_path = dictionary_string(config, "custom_voice_config_path", "");
+    native.custom_voice_speaker_name = dictionary_string(config, "custom_voice_speaker_name", "");
+    native.mode = dictionary_string(config, "mode", "base");
+    native.provider = dictionary_string(config, "provider", "CPU");
+    native.decoder_provider_requested = dictionary_string(config, "decoder_provider_requested", "CPU");
+    native.decoder_provider = dictionary_string(config, "decoder_provider", "CPU");
+    native.intra_op_threads = dictionary_i32(config, "intra_op_threads", 0);
+    native.inter_op_threads = dictionary_i32(config, "inter_op_threads", 0);
+    native.optimization_level = dictionary_i32(config, "optimization_level", 99);
+    native.decoder_optimized_model_path = dictionary_string(config, "decoder_optimized_model_path", "");
+    native.decoder_intra_op_threads = dictionary_i32(config, "decoder_intra_op_threads", 0);
+    native.decoder_inter_op_threads = dictionary_i32(config, "decoder_inter_op_threads", 0);
+    native.decoder_optimization_level = dictionary_i32(config, "decoder_optimization_level", 99);
+    native.sample_rate = dictionary_i32(config, "sample_rate", 24000);
+    native.max_text_tokens = dictionary_i32(config, "max_text_tokens", 512);
+    native.target_frames_per_text_token = dictionary_f32(config, "target_frames_per_text_token", 5.0f);
+    native.target_frame_padding = dictionary_i32(config, "target_frame_padding", 2);
+    native.min_frames_before_eos = dictionary_i32(config, "min_frames_before_eos", 8);
+    native.max_frames = dictionary_i32(config, "max_frames", 96);
+    native.force_japanese_language = dictionary_bool(config, "force_japanese_language", true);
+    native.use_style_instruction = dictionary_bool(config, "use_style_instruction", true);
+    native.use_icl_voice_clone = dictionary_bool(config, "use_icl_voice_clone", false);
+    native.icl_ref_text = dictionary_string(config, "icl_ref_text", "");
+    native.normalize_waveform = dictionary_bool(config, "normalize_waveform", true);
+    native.waveform_gain = dictionary_f32(config, "waveform_gain", 0.9f);
+    native.stateful_chunk_frames = dictionary_i32(config, "stateful_chunk_frames", 12);
+    native.talker_n_ctx = dictionary_i32(config, "talker_n_ctx", 1024);
+    native.talker_n_batch = dictionary_i32(config, "talker_n_batch", 1024);
+    native.predictor_n_ctx = dictionary_i32(config, "predictor_n_ctx", 128);
+    native.predictor_n_batch = dictionary_i32(config, "predictor_n_batch", 128);
+    native.n_threads = dictionary_i32(config, "n_threads", -1);
+    native.n_gpu_layers = dictionary_i32(config, "n_gpu_layers", 0);
+    native.predictor_n_gpu_layers = dictionary_i32(config, "predictor_n_gpu_layers", -2);
+    native.use_mmap = dictionary_bool(config, "use_mmap", true);
+    native.use_mlock = dictionary_bool(config, "use_mlock", false);
+    native.flash_attn_type = dictionary_i32(config, "flash_attn_type", -1);
+    native.type_k = dictionary_i32(config, "type_k", -1);
+    native.type_v = dictionary_i32(config, "type_v", -1);
+    return native;
+}
+
+gotst::QwenTtsPipelineRequest qwen_tts_request_from_dictionary(const Dictionary &params) {
+    gotst::QwenTtsPipelineRequest request;
+    request.text = dictionary_string(params, "text", "");
+    request.mode = dictionary_string(params, "mode", "");
+    request.style_instruction = dictionary_string(params, "style_instruction", "");
+    request.voice_design = dictionary_string(params, "voice_design", "");
+    request.seed = dictionary_i64(params, "seed", 1);
+    return request;
 }
 
 std::string irodori_artifact_path(const Dictionary &config, const Dictionary &artifacts, const char *key) {
@@ -815,6 +897,31 @@ void GotstSpeechRuntime::_bind_methods() {
         &GotstSpeechRuntime::load_custom_voice_config
     );
     ClassDB::bind_method(
+        D_METHOD(
+            "resolve_custom_voice_speaker_embedding",
+            "config_json_path",
+            "speaker_name",
+            "codec_embedding_onnx_path",
+            "hidden_size"
+        ),
+        &GotstSpeechRuntime::resolve_custom_voice_speaker_embedding
+    );
+    ClassDB::bind_method(
+        D_METHOD(
+            "prepare_voice_clone_decoder_codes",
+            "generated_codes",
+            "generated_frame_count",
+            "ref_codes",
+            "ref_frame_count",
+            "codec_groups"
+        ),
+        &GotstSpeechRuntime::prepare_voice_clone_decoder_codes
+    );
+    ClassDB::bind_method(
+        D_METHOD("trim_voice_clone_waveform_prefix", "waveform", "trim_prefix_frames", "decode_frame_count"),
+        &GotstSpeechRuntime::trim_voice_clone_waveform_prefix
+    );
+    ClassDB::bind_method(
         D_METHOD("emit_partial_synthesis", "request_id", "pcm_chunk", "sample_rate"),
         &GotstSpeechRuntime::emit_partial_synthesis
     );
@@ -847,6 +954,34 @@ void GotstSpeechRuntime::_bind_methods() {
         &GotstSpeechRuntime::cancel_tts_waveform_stream
     );
     ClassDB::bind_method(
+        D_METHOD("load_qwen_tts", "config"),
+        &GotstSpeechRuntime::load_qwen_tts
+    );
+    ClassDB::bind_method(
+        D_METHOD("is_qwen_tts_loaded"),
+        &GotstSpeechRuntime::is_qwen_tts_loaded
+    );
+    ClassDB::bind_method(
+        D_METHOD("prepare_qwen_tts_prompt", "params"),
+        &GotstSpeechRuntime::prepare_qwen_tts_prompt
+    );
+    ClassDB::bind_method(
+        D_METHOD("start_qwen_tts_stream", "params", "request_id", "chunk_frames"),
+        &GotstSpeechRuntime::start_qwen_tts_stream
+    );
+    ClassDB::bind_method(
+        D_METHOD("poll_qwen_tts_stream"),
+        &GotstSpeechRuntime::poll_qwen_tts_stream
+    );
+    ClassDB::bind_method(
+        D_METHOD("cancel_qwen_tts_stream", "request_id"),
+        &GotstSpeechRuntime::cancel_qwen_tts_stream
+    );
+    ClassDB::bind_method(
+        D_METHOD("get_qwen_custom_voice_speaker_names"),
+        &GotstSpeechRuntime::get_qwen_custom_voice_speaker_names
+    );
+    ClassDB::bind_method(
         D_METHOD("load_tts_waveform_decoder", "config"),
         &GotstSpeechRuntime::load_tts_waveform_decoder
     );
@@ -865,6 +1000,18 @@ void GotstSpeechRuntime::_bind_methods() {
     ClassDB::bind_method(
         D_METHOD("is_irodori_tts_loaded"),
         &GotstSpeechRuntime::is_irodori_tts_loaded
+    );
+    ClassDB::bind_method(
+        D_METHOD("load_irodori_tokenizer", "tokenizer_json_path", "tokenizer_config_path"),
+        &GotstSpeechRuntime::load_irodori_tokenizer
+    );
+    ClassDB::bind_method(
+        D_METHOD("normalize_irodori_text", "text"),
+        &GotstSpeechRuntime::normalize_irodori_text
+    );
+    ClassDB::bind_method(
+        D_METHOD("tokenize_irodori_text", "text", "max_tokens", "force_empty_mask"),
+        &GotstSpeechRuntime::tokenize_irodori_text
     );
     ClassDB::bind_method(
         D_METHOD("start_irodori_tts_stream", "params", "request_id"),
@@ -2165,6 +2312,149 @@ bool GotstSpeechRuntime::load_custom_voice_config(const String &json_path) {
     return !custom_voice_speakers_.empty();
 }
 
+PackedFloat32Array GotstSpeechRuntime::resolve_custom_voice_speaker_embedding(
+    const String &config_json_path,
+    const String &speaker_name,
+    const String &codec_embedding_onnx_path,
+    int64_t hidden_size
+) {
+    if(hidden_size <= 0) {
+        ERR_PRINT("CustomVoice speaker embedding requires a positive hidden_size.");
+        return PackedFloat32Array();
+    }
+
+    const std::string speaker = std::string(speaker_name.utf8().get_data());
+    const std::string config_path = std::string(config_json_path.utf8().get_data());
+    const std::string embedding_path = std::string(codec_embedding_onnx_path.utf8().get_data());
+    if(speaker.empty() || config_path.empty() || embedding_path.empty()) {
+        ERR_PRINT("CustomVoice speaker embedding requires config path, speaker name, and codec embedding path.");
+        return PackedFloat32Array();
+    }
+
+    if(!load_custom_voice_config(config_json_path)) {
+        ERR_PRINT(String("CustomVoice speaker config load failed: ") + config_json_path);
+        return PackedFloat32Array();
+    }
+
+    auto speaker_it = custom_voice_speakers_.find(speaker);
+    if(speaker_it == custom_voice_speakers_.end() || speaker_it->second.empty()) {
+        ERR_PRINT(String("CustomVoice speaker not found: ") + speaker_name);
+        return PackedFloat32Array();
+    }
+
+    gonx::InferenceSession embedding_session;
+    gonx::SessionConfig session_config;
+    session_config.providers = {gonx::ExecutionProvider::CPU};
+    auto load_status = embedding_session.load(std::filesystem::path(embedding_path), session_config);
+    if(load_status.has_error()) {
+        ERR_PRINT(String("CustomVoice codec embedding load failed: ") + String(load_status.error().message.c_str()));
+        return PackedFloat32Array();
+    }
+
+    std::vector<float> embedding_values;
+    embedding_values.reserve(
+        speaker_it->second.size() * static_cast<size_t>(hidden_size)
+    );
+    gotst::detail::SingleTokenEmbeddingRunScratch scratch;
+    for(int64_t token_id : speaker_it->second) {
+        auto token_embedding = gotst::detail::run_single_token_float_embedding(
+            embedding_session,
+            scratch,
+            token_id
+        );
+        if(!token_embedding.is_ok()) {
+            ERR_PRINT(String("CustomVoice codec embedding inference failed: ") +
+                String(token_embedding.error_message().c_str()));
+            return PackedFloat32Array();
+        }
+        const std::span<const float> values = token_embedding.value().values;
+        if(values.size() < static_cast<size_t>(hidden_size)) {
+            ERR_PRINT("CustomVoice codec embedding returned too few values.");
+            return PackedFloat32Array();
+        }
+        embedding_values.insert(
+            embedding_values.end(),
+            values.begin(),
+            values.begin() + static_cast<std::ptrdiff_t>(hidden_size)
+        );
+    }
+
+    return pack_float_array(embedding_values);
+}
+
+Dictionary GotstSpeechRuntime::prepare_voice_clone_decoder_codes(
+    const PackedInt64Array &generated_codes,
+    int64_t generated_frame_count,
+    const PackedInt64Array &ref_codes,
+    int64_t ref_frame_count,
+    int64_t codec_groups
+) const {
+    Dictionary output;
+    const int64_t generated_count = generated_codes.size();
+    if(generated_count <= 0 || generated_frame_count <= 0) {
+        output["error"] = "generated voice-clone codes are empty.";
+        return output;
+    }
+    if(ref_frame_count <= 0 || codec_groups <= 0 || ref_codes.size() != ref_frame_count * codec_groups) {
+        output["audio_codes"] = generated_codes;
+        output["decode_frame_count"] = generated_frame_count;
+        output["trim_prefix_frames"] = 0;
+        output["visible_code_count"] = generated_count;
+        return output;
+    }
+
+    PackedInt64Array audio_codes;
+    audio_codes.resize(ref_codes.size() + generated_count);
+    if(ref_codes.size() > 0) {
+        std::memcpy(audio_codes.ptrw(), ref_codes.ptr(), static_cast<size_t>(ref_codes.size()) * sizeof(int64_t));
+    }
+    if(generated_count > 0) {
+        std::memcpy(
+            audio_codes.ptrw() + ref_codes.size(),
+            generated_codes.ptr(),
+            static_cast<size_t>(generated_count) * sizeof(int64_t)
+        );
+    }
+
+    output["audio_codes"] = audio_codes;
+    output["decode_frame_count"] = ref_frame_count + generated_frame_count;
+    output["trim_prefix_frames"] = ref_frame_count;
+    output["visible_code_count"] = generated_count;
+    return output;
+}
+
+PackedFloat32Array GotstSpeechRuntime::trim_voice_clone_waveform_prefix(
+    const PackedFloat32Array &waveform,
+    int64_t trim_prefix_frames,
+    int64_t decode_frame_count
+) const {
+    if(waveform.is_empty() || trim_prefix_frames <= 0 || decode_frame_count <= 0) {
+        return waveform;
+    }
+
+    const int64_t trim_samples = static_cast<int64_t>(
+        (static_cast<double>(trim_prefix_frames) /
+            static_cast<double>(std::max<int64_t>(decode_frame_count, 1))) *
+        static_cast<double>(waveform.size())
+    );
+    if(trim_samples <= 0) {
+        return waveform;
+    }
+    if(trim_samples >= waveform.size()) {
+        return PackedFloat32Array();
+    }
+
+    PackedFloat32Array trimmed;
+    const int64_t remaining = waveform.size() - trim_samples;
+    trimmed.resize(remaining);
+    std::memcpy(
+        trimmed.ptrw(),
+        waveform.ptr() + trim_samples,
+        static_cast<size_t>(remaining) * sizeof(float)
+    );
+    return trimmed;
+}
+
 void GotstSpeechRuntime::emit_partial_synthesis(int64_t request_id, const PackedFloat32Array &pcm_chunk, int64_t sample_rate) {
     emit_signal("partial_synthesis_available", request_id, pcm_chunk, sample_rate);
 }
@@ -2248,6 +2538,92 @@ bool GotstSpeechRuntime::load_tts_code_generator(const Dictionary &config) {
 
 bool GotstSpeechRuntime::is_tts_code_generator_loaded() const {
     return tts_code_generator_ && tts_code_generator_->is_loaded();
+}
+
+bool GotstSpeechRuntime::load_qwen_tts(const Dictionary &config) {
+    stop_waveform_stream_workers();
+    clear_waveform_events();
+
+    qwen_tts_pipeline_ = std::make_unique<gotst::QwenTtsPipeline>();
+    auto result = qwen_tts_pipeline_->load(qwen_tts_config_from_dictionary(config));
+    if(!result.is_ok()) {
+        ERR_PRINT(String("Qwen TTS pipeline load failed: ") + String(result.error_message().c_str()));
+        qwen_tts_pipeline_.reset();
+        return false;
+    }
+    return true;
+}
+
+bool GotstSpeechRuntime::is_qwen_tts_loaded() const {
+    return qwen_tts_pipeline_ && qwen_tts_pipeline_->is_loaded();
+}
+
+Dictionary GotstSpeechRuntime::prepare_qwen_tts_prompt(const Dictionary &params) {
+    Dictionary output;
+    if(!qwen_tts_pipeline_ || !qwen_tts_pipeline_->is_loaded()) {
+        output["error"] = "Qwen TTS pipeline is not loaded.";
+        return output;
+    }
+    auto result = qwen_tts_pipeline_->prepare_prompt(qwen_tts_request_from_dictionary(params));
+    if(!result.is_ok()) {
+        output["error"] = String(result.error_message().c_str());
+        return output;
+    }
+    return pack_qwen_prompt_result(result.value());
+}
+
+Dictionary GotstSpeechRuntime::start_qwen_tts_stream(
+    const Dictionary &params,
+    int64_t request_id,
+    int64_t chunk_frames
+) {
+    Dictionary output;
+    if(!qwen_tts_pipeline_ || !qwen_tts_pipeline_->is_loaded()) {
+        output["error"] = "Qwen TTS pipeline is not loaded.";
+        return output;
+    }
+
+    ensure_waveform_stream_workers_started();
+    if(!waveform_stream_active_.load(std::memory_order_acquire)) {
+        clear_waveform_events();
+    }
+
+    WaveformStreamRequest request;
+    request.request_id = request_id;
+    request.chunk_frames = static_cast<int32_t>(std::max<int64_t>(1, chunk_frames));
+    request.queued_at = std::chrono::steady_clock::now();
+    request.cancel = std::make_shared<gotst::CancellationToken>();
+    request.use_qwen_pipeline = true;
+    request.qwen_request = qwen_tts_request_from_dictionary(params);
+    {
+        std::lock_guard<std::mutex> lock(waveform_request_mutex_);
+        waveform_request_queue_.push_back(std::move(request));
+        waveform_stream_active_.store(true, std::memory_order_release);
+    }
+    waveform_request_cv_.notify_one();
+
+    output["started"] = true;
+    output["request_id"] = request_id;
+    return output;
+}
+
+Array GotstSpeechRuntime::poll_qwen_tts_stream() {
+    return poll_tts_waveform_stream();
+}
+
+void GotstSpeechRuntime::cancel_qwen_tts_stream(int64_t request_id) {
+    cancel_tts_waveform_stream(request_id);
+}
+
+Array GotstSpeechRuntime::get_qwen_custom_voice_speaker_names() const {
+    Array names;
+    if(!qwen_tts_pipeline_ || !qwen_tts_pipeline_->is_loaded()) {
+        return names;
+    }
+    for(const std::string &name : qwen_tts_pipeline_->custom_voice_speaker_names()) {
+        names.push_back(String(name.c_str()));
+    }
+    return names;
 }
 
 Dictionary GotstSpeechRuntime::generate_tts_codes(const Dictionary &params) {
@@ -2441,6 +2817,99 @@ void GotstSpeechRuntime::waveform_generation_worker_main() {
 
         const auto stream_start = Clock::now();
         const double pipeline_queue_wait_ms = Ms(stream_start - request.queued_at).count();
+
+        if(request.use_qwen_pipeline) {
+            if(!qwen_tts_pipeline_ || !qwen_tts_pipeline_->is_loaded()) {
+                WaveformStreamEvent event;
+                event.request_id = request.request_id;
+                event.is_error = true;
+                event.error_message = "Qwen TTS pipeline is not loaded.";
+                event.elapsed_ms = round_ms(Ms(Clock::now() - stream_start).count());
+                event.pipeline_queue_wait_ms = round_ms(pipeline_queue_wait_ms);
+                push_waveform_event(std::move(event));
+                waveform_stream_active_.store(false, std::memory_order_release);
+                continue;
+            }
+
+            auto result = qwen_tts_pipeline_->synthesize_streaming(
+                request.qwen_request,
+                request.chunk_frames,
+                [this, &request, stream_start, pipeline_queue_wait_ms](const gotst::QwenTtsStreamChunk &chunk) {
+                    if(request.cancel && request.cancel->is_cancelled()) {
+                        return;
+                    }
+                    const auto pack_started = Clock::now();
+                    PackedFloat32Array waveform = pack_float_array(chunk.waveform);
+                    const double pack_ms = Ms(Clock::now() - pack_started).count();
+
+                    WaveformStreamEvent event;
+                    event.request_id = request.request_id;
+                    event.waveform = std::move(waveform);
+                    event.sample_rate = chunk.sample_rate;
+                    event.frame_count = chunk.frame_count;
+                    event.code_count = chunk.code_count;
+                    event.chunk_index = chunk.chunk_index;
+                    event.chunk_samples = static_cast<int32_t>(chunk.waveform.size());
+                    event.is_final = chunk.is_final;
+                    event.elapsed_ms = round_ms(Ms(Clock::now() - stream_start).count());
+                    event.codegen_ms = round_ms(chunk.codegen_ms);
+                    event.decoder_ms = round_ms(chunk.decoder_ms);
+                    event.decoder_inference_ms = round_ms(chunk.decoder_inference_ms);
+                    event.decoder_postprocess_ms = round_ms(chunk.decoder_postprocess_ms);
+                    event.pipeline_queue_wait_ms = round_ms(pipeline_queue_wait_ms);
+                    event.native_pack_ms = round_ms(pack_ms);
+                    event.decoder_provider_requested = String(chunk.decoder_provider_requested.c_str());
+                    event.decoder_provider_effective = String(chunk.decoder_provider_effective.c_str());
+                    event.decoder_cpu_fallback_node_count = chunk.decoder_cpu_fallback_node_count;
+                    event.decoder_fixed_shape = chunk.decoder_fixed_shape;
+                    push_waveform_event(std::move(event));
+                },
+                request.cancel.get()
+            );
+
+            if(!result.is_ok()) {
+                if(!request.cancel || !request.cancel->is_cancelled()) {
+                    WaveformStreamEvent event;
+                    event.request_id = request.request_id;
+                    event.is_error = true;
+                    event.error_message = String(result.error_message().c_str());
+                    event.elapsed_ms = round_ms(Ms(Clock::now() - stream_start).count());
+                    event.pipeline_queue_wait_ms = round_ms(pipeline_queue_wait_ms);
+                    push_waveform_event(std::move(event));
+                }
+            } else {
+                const auto &synth = result.value();
+                WaveformStreamEvent event;
+                event.request_id = request.request_id;
+                event.is_stats = true;
+                event.frame_count = synth.frame_count;
+                event.code_count = synth.code_count;
+                event.elapsed_ms = round_ms(synth.elapsed_ms);
+                event.codegen_ms = round_ms(synth.codegen_ms);
+                event.decoder_ms = round_ms(synth.decoder_ms);
+                event.decoder_inference_ms = round_ms(synth.decoder_inference_ms);
+                event.decoder_postprocess_ms = round_ms(synth.decoder_postprocess_ms);
+                event.pipeline_queue_wait_ms = round_ms(pipeline_queue_wait_ms);
+                event.talker_prefill_ms = round_ms(synth.talker_prefill_ms);
+                event.talker_decode_ms = round_ms(synth.talker_decode_ms);
+                event.predictor_ms = round_ms(synth.predictor_ms);
+                event.onnx_embedding_ms = round_ms(synth.onnx_embedding_ms);
+                event.codegen_other_ms = round_ms(synth.codegen_other_ms);
+                push_waveform_event(std::move(event));
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(waveform_request_mutex_);
+                if(waveform_active_request_id_ == request.request_id) {
+                    waveform_active_request_id_ = 0;
+                    waveform_active_cancel_.reset();
+                }
+            }
+            if(!request.cancel || !request.cancel->is_cancelled()) {
+                waveform_stream_active_.store(false, std::memory_order_release);
+            }
+            continue;
+        }
 
         auto decoder_stream_result = tts_waveform_decoder_->create_stream();
         if(!decoder_stream_result.is_ok()) {
@@ -2783,6 +3252,69 @@ bool GotstSpeechRuntime::load_irodori_tts(const Dictionary &config) {
 
 bool GotstSpeechRuntime::is_irodori_tts_loaded() const {
     return irodori_tts_session_ && irodori_tts_session_->is_loaded();
+}
+
+bool GotstSpeechRuntime::load_irodori_tokenizer(
+    const String &tokenizer_json_path,
+    const String &tokenizer_config_path
+) {
+    irodori_text_tokenizer_ = std::make_unique<gotst::IrodoriTextTokenizer>();
+    auto result = irodori_text_tokenizer_->load(
+        std::string(tokenizer_json_path.utf8().get_data()),
+        std::string(tokenizer_config_path.utf8().get_data())
+    );
+    if(!result.is_ok()) {
+        ERR_PRINT(String("Irodori tokenizer load failed: ") + String(result.error_message().c_str()));
+        irodori_text_tokenizer_.reset();
+        return false;
+    }
+    return true;
+}
+
+String GotstSpeechRuntime::normalize_irodori_text(const String &text) const {
+    const std::string normalized = gotst::normalize_irodori_v3_text(
+        std::string(text.utf8().get_data())
+    );
+    return String::utf8(normalized.c_str());
+}
+
+Dictionary GotstSpeechRuntime::tokenize_irodori_text(
+    const String &text,
+    int64_t max_tokens,
+    bool force_empty_mask
+) const {
+    Dictionary output;
+    if(!irodori_text_tokenizer_ || !irodori_text_tokenizer_->is_loaded()) {
+        output["error"] = "Irodori tokenizer is not loaded.";
+        return output;
+    }
+    const std::string normalized = gotst::normalize_irodori_v3_text(
+        std::string(text.utf8().get_data())
+    );
+    auto result = irodori_text_tokenizer_->encode(
+        normalized,
+        static_cast<int32_t>(std::max<int64_t>(0, max_tokens)),
+        force_empty_mask
+    );
+    if(!result.is_ok()) {
+        output["error"] = String(result.error_message().c_str());
+        return output;
+    }
+    const gotst::IrodoriTokenizedText &tokens = result.value();
+    PackedInt64Array token_ids;
+    token_ids.resize(static_cast<int64_t>(tokens.token_ids.size()));
+    if(!tokens.token_ids.empty()) {
+        std::memcpy(token_ids.ptrw(), tokens.token_ids.data(), tokens.token_ids.size() * sizeof(int64_t));
+    }
+    PackedInt64Array token_mask;
+    token_mask.resize(static_cast<int64_t>(tokens.token_mask.size()));
+    for(size_t index = 0; index < tokens.token_mask.size(); ++index) {
+        token_mask.set(static_cast<int64_t>(index), tokens.token_mask[index] != 0 ? 1 : 0);
+    }
+    output["normalized_text"] = String::utf8(normalized.c_str());
+    output["token_ids"] = token_ids;
+    output["token_mask"] = token_mask;
+    return output;
 }
 
 void GotstSpeechRuntime::push_irodori_event(IrodoriStreamEvent event) {

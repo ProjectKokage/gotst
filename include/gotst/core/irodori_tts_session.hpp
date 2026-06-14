@@ -3,6 +3,7 @@
 #include "gotst/core/cancellation_token.hpp"
 #include "gotst/core/result.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -18,6 +19,7 @@ enum class IrodoriTtsMode {
     BaseV3,
     BaseV2,
     VoiceDesignV2,
+    VoiceDesignV3,
 };
 
 struct IrodoriTtsBucket {
@@ -182,6 +184,12 @@ Result<std::vector<std::string>> build_irodori_cfg_branches(
     float cfg_scale_text,
     float cfg_scale_caption,
     float cfg_scale_speaker
+);
+
+Result<std::vector<std::string>> build_irodori_cfg_step_drop_branches(
+    const std::vector<std::string> &branches,
+    const std::string &guidance_mode,
+    size_t step_index
 );
 
 std::string build_irodori_condition_cache_key(

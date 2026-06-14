@@ -15,6 +15,7 @@ TEST_CASE("Irodori mode parser accepts base and voice design aliases") {
     CHECK(gotst::parse_irodori_tts_mode("base_v2") == gotst::IrodoriTtsMode::BaseV2);
     CHECK(gotst::parse_irodori_tts_mode("voice_design_v2") == gotst::IrodoriTtsMode::VoiceDesignV2);
     CHECK(gotst::parse_irodori_tts_mode("voice_design") == gotst::IrodoriTtsMode::VoiceDesignV2);
+    CHECK(gotst::parse_irodori_tts_mode("voice_design_v3") == gotst::IrodoriTtsMode::VoiceDesignV3);
     CHECK(gotst::parse_irodori_tts_mode("other") == gotst::IrodoriTtsMode::Unknown);
 }
 
@@ -79,6 +80,16 @@ TEST_CASE("Irodori CFG branch construction follows mode-specific conditions") {
     REQUIRE(voice_design.is_ok());
     CHECK(voice_design.value() == std::vector<std::string>{"conditional", "drop_all"});
 
+    auto voice_design_v3 = gotst::build_irodori_cfg_branches(
+        gotst::IrodoriTtsMode::VoiceDesignV3,
+        "alternating",
+        3.0f,
+        3.0f,
+        5.0f
+    );
+    REQUIRE(voice_design_v3.is_ok());
+    CHECK(voice_design_v3.value() == std::vector<std::string>{"conditional", "drop_text", "drop_speaker", "drop_caption"});
+
     auto invalid_joint = gotst::build_irodori_cfg_branches(
         gotst::IrodoriTtsMode::VoiceDesignV2,
         "joint",
@@ -88,6 +99,43 @@ TEST_CASE("Irodori CFG branch construction follows mode-specific conditions") {
     );
     CHECK_FALSE(invalid_joint.is_ok());
     CHECK_THAT(invalid_joint.error_message(), ContainsSubstring("joint CFG"));
+}
+
+TEST_CASE("Irodori CFG step branch planner matches guidance modes") {
+    std::vector<std::string> branches = {
+        "conditional",
+        "drop_text",
+        "drop_speaker",
+        "drop_caption",
+    };
+
+    auto independent = gotst::build_irodori_cfg_step_drop_branches(branches, "independent", 0);
+    REQUIRE(independent.is_ok());
+    CHECK(independent.value() == std::vector<std::string>{"text", "speaker", "caption"});
+
+    auto alternating0 = gotst::build_irodori_cfg_step_drop_branches(branches, "alternating", 0);
+    REQUIRE(alternating0.is_ok());
+    CHECK(alternating0.value() == std::vector<std::string>{"text"});
+
+    auto alternating2 = gotst::build_irodori_cfg_step_drop_branches(branches, "alternating", 2);
+    REQUIRE(alternating2.is_ok());
+    CHECK(alternating2.value() == std::vector<std::string>{"caption"});
+
+    auto joint = gotst::build_irodori_cfg_step_drop_branches(
+        std::vector<std::string>{"conditional", "drop_all"},
+        "joint",
+        0
+    );
+    REQUIRE(joint.is_ok());
+    CHECK(joint.value() == std::vector<std::string>{"all"});
+
+    auto cfg_off = gotst::build_irodori_cfg_step_drop_branches(
+        std::vector<std::string>{"conditional"},
+        "alternating",
+        0
+    );
+    REQUIRE(cfg_off.is_ok());
+    CHECK(cfg_off.value().empty());
 }
 
 TEST_CASE("Irodori cache keys separate mode, caption, and reference state") {

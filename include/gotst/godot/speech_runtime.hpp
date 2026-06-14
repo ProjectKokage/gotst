@@ -3,8 +3,10 @@
 #include "gotst/core/speech_runtime_core.hpp"
 #include "gotst/core/speech_encoder_session.hpp"
 #include "gotst/core/tts_code_generator.hpp"
+#include "gotst/core/qwen_tts_pipeline.hpp"
 #include "gotst/core/tts_waveform_decoder.hpp"
 #include "gotst/core/irodori_tts_session.hpp"
+#include "gotst/core/text_tokenization.hpp"
 #include "gotst/core/asr_token_decoder.hpp"
 #include "gotst/core/qwen3_forced_aligner.hpp"
 #include "gotst/core/ten_vad.hpp"
@@ -198,6 +200,24 @@ public:
     Dictionary get_custom_voice_speaker_ids(const String &speaker_name) const;
     Array get_custom_voice_speaker_names() const;
     bool load_custom_voice_config(const String &json_path);
+    PackedFloat32Array resolve_custom_voice_speaker_embedding(
+        const String &config_json_path,
+        const String &speaker_name,
+        const String &codec_embedding_onnx_path,
+        int64_t hidden_size
+    );
+    Dictionary prepare_voice_clone_decoder_codes(
+        const PackedInt64Array &generated_codes,
+        int64_t generated_frame_count,
+        const PackedInt64Array &ref_codes,
+        int64_t ref_frame_count,
+        int64_t codec_groups
+    ) const;
+    PackedFloat32Array trim_voice_clone_waveform_prefix(
+        const PackedFloat32Array &waveform,
+        int64_t trim_prefix_frames,
+        int64_t decode_frame_count
+    ) const;
 
     Dictionary get_supported_tts_languages() const;
     int64_t get_tts_language_token_id(const String &language_key) const;
@@ -220,12 +240,22 @@ public:
     Dictionary start_tts_waveform_stream(const Dictionary &params, int64_t request_id, int64_t chunk_frames);
     Array poll_tts_waveform_stream();
     void cancel_tts_waveform_stream(int64_t request_id);
+    bool load_qwen_tts(const Dictionary &config);
+    bool is_qwen_tts_loaded() const;
+    Dictionary prepare_qwen_tts_prompt(const Dictionary &params);
+    Dictionary start_qwen_tts_stream(const Dictionary &params, int64_t request_id, int64_t chunk_frames);
+    Array poll_qwen_tts_stream();
+    void cancel_qwen_tts_stream(int64_t request_id);
+    Array get_qwen_custom_voice_speaker_names() const;
     bool load_tts_waveform_decoder(const Dictionary &config);
     bool is_tts_waveform_decoder_loaded() const;
     Dictionary decode_tts_codes_to_waveform(const PackedInt64Array &audio_codes, int64_t frame_count) const;
 
     bool load_irodori_tts(const Dictionary &config);
     bool is_irodori_tts_loaded() const;
+    bool load_irodori_tokenizer(const String &tokenizer_json_path, const String &tokenizer_config_path);
+    String normalize_irodori_text(const String &text) const;
+    Dictionary tokenize_irodori_text(const String &text, int64_t max_tokens, bool force_empty_mask) const;
     Dictionary start_irodori_tts_stream(const Dictionary &params, int64_t request_id);
     Array poll_irodori_tts_stream();
     void cancel_irodori_tts_stream(int64_t request_id);
@@ -253,8 +283,10 @@ private:
     std::unique_ptr<gotst::SpeakerEncoderSession> speaker_encoder_;
     std::unique_ptr<gotst::SpeechTokenizerEncoderSession> speech_tokenizer_encoder_;
     std::unique_ptr<gotst::TtsCodeGenerator> tts_code_generator_;
+    std::unique_ptr<gotst::QwenTtsPipeline> qwen_tts_pipeline_;
     std::unique_ptr<gotst::TtsWaveformDecoder> tts_waveform_decoder_;
     std::unique_ptr<gotst::IrodoriTtsSession> irodori_tts_session_;
+    std::unique_ptr<gotst::IrodoriTextTokenizer> irodori_text_tokenizer_;
     int32_t tts_waveform_decoder_sample_rate_ = 24000;
     std::unique_ptr<gotst::AsrTokenDecoder> asr_token_decoder_;
     std::unique_ptr<gotst::Qwen3ForcedAligner> qwen3_forced_aligner_;
@@ -303,6 +335,8 @@ private:
         int32_t chunk_frames = 0;
         std::chrono::steady_clock::time_point queued_at;
         std::shared_ptr<gotst::CancellationToken> cancel;
+        bool use_qwen_pipeline = false;
+        gotst::QwenTtsPipelineRequest qwen_request;
     };
 
     struct WaveformDecodeJob {
