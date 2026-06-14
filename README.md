@@ -76,6 +76,40 @@ This keeps the repo directly usable as an addon workspace.
 - `godorama` remains the generic GGUF bridge.
 - `gonx` remains the generic ONNX bridge.
 
+## Acknowledgements
+
+`gotst` builds on substantial open source work from the speech, inference, and
+Godot ecosystems:
+
+- Godot Engine and `godot-cpp` provide the Godot 4 GDExtension API and C++
+  binding layer.
+- `godorama` provides the generic GGUF bridge used by `gotst` for local
+  llama.cpp-backed model execution.
+- `gonx` provides the generic ONNX Runtime bridge used by `gotst` for ONNX
+  session management and execution-provider selection.
+- llama.cpp and ggml provide the local GGUF inference runtime used through
+  `godorama`.
+- ONNX Runtime provides the ONNX model execution runtime used through `gonx`.
+- tokenizers-cpp, SentencePiece, and msgpack-c support tokenizer loading and
+  text tokenization paths.
+- The Irodori TTS model family informs the native Irodori speech synthesis
+  session and its exported ONNX/CoreML artifact layout.
+- The Qwen ASR and Qwen TTS model families inform the native Qwen speech
+  frontend, tokenization, embedding, decoding, and hybrid GGUF/ONNX pipeline
+  paths.
+- TEN-VAD provides the vendored voice activity detection runtime under
+  `thirdparty/ten_vad`. It is distributed under its own upstream license terms,
+  including additional conditions on top of Apache-2.0, and includes
+  LPCNet-derived BSD notices. See `thirdparty/ten_vad/LICENSE` and
+  `thirdparty/ten_vad/NOTICES`.
+
+This section is an acknowledgement, not a complete third-party notice. Preserve
+the applicable upstream license and notice files when redistributing gotst or
+binary builds that include these components. Model weights, tokenizer assets,
+converted ONNX/CoreML artifacts, and GGUF files are external inputs to gotst;
+redistribute them only under their own model cards, licenses, and acceptable-use
+terms.
+
 ## Next implementation steps
 
 1. Move more of the Qwen TTS autoregressive inner loop from GDScript into native code.
